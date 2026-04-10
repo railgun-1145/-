@@ -22,12 +22,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 // --- 核心状态注册表 ---
 #[derive(Clone)]
-pub struct WindowState {
-    pub original_ex_style: u32,
-    pub current_alpha: u8,
-    pub original_is_topmost: bool,
-    pub user_pref_topmost: bool,
-    pub title: String,
+struct WindowState {
+    original_ex_style: u32,
+    current_alpha: u8,
+    original_is_topmost: bool,
+    user_pref_topmost: bool,
+    title: String,
 }
 
 lazy_static! {
@@ -87,7 +87,7 @@ fn hide_root_window() {
 
 // --- 底层核心逻辑 ---
 
-pub unsafe fn get_window_title(hwnd: HWND) -> String {
+unsafe fn get_window_title(hwnd: HWND) -> String {
     let mut text: [u16; 512] = [0; 512];
     let len = GetWindowTextW(hwnd, &mut text);
     if len > 0 {
@@ -97,7 +97,7 @@ pub unsafe fn get_window_title(hwnd: HWND) -> String {
     }
 }
 
-pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), String> {
+unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), String> {
     if hwnd.0.is_null() {
         return Err("Invalid HWND".into());
     }
@@ -157,7 +157,7 @@ unsafe fn apply_transparency_to_hwnd(hwnd: HWND, alpha: u8, topmost: bool) -> Re
     Ok(())
 }
 
-pub unsafe fn toggle_topmost(hwnd: HWND) {
+unsafe fn toggle_topmost(hwnd: HWND) {
     if hwnd.0.is_null() {
         return;
     }
@@ -171,7 +171,7 @@ pub unsafe fn toggle_topmost(hwnd: HWND) {
     request_ui_repaint();
 }
 
-pub unsafe fn restore_window(hwnd: HWND) {
+unsafe fn restore_window(hwnd: HWND) {
     if hwnd.0.is_null() {
         return;
     }
@@ -193,7 +193,7 @@ pub unsafe fn restore_window(hwnd: HWND) {
     request_ui_repaint();
 }
 
-pub unsafe fn restore_all_windows() {
+unsafe fn restore_all_windows() {
     let hwnds: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
     for hwnd_val in hwnds {
         restore_window(HWND(hwnd_val as *mut _));
@@ -213,8 +213,6 @@ unsafe fn is_own_hwnd(hwnd: HWND) -> bool {
 // --- 事件钩子 ---
 // --- GUI 应用程序 ---
 struct TransGlassApp {
-    #[allow(dead_code)]
-    config: HotkeyConfig,
     should_exit: bool,
 }
 
@@ -252,10 +250,7 @@ impl TransGlassApp {
             }
         }
 
-        if !font_loaded {
-            // 如果系统字体加载失败，记录日志或通过 label 提示
-            eprintln!("Warning: Failed to load system Chinese fonts.");
-        }
+        let _ = font_loaded;
         cc.egui_ctx.set_fonts(fonts);
 
         // 2. 仿 Trae 风格的深色 UI
@@ -276,10 +271,7 @@ impl TransGlassApp {
             }
         }
 
-        Self {
-            config: load_or_create_hotkey_config(),
-            should_exit: false,
-        }
+        Self { should_exit: false }
     }
 }
 

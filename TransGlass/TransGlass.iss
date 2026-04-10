@@ -71,13 +71,3 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 Type: files; Name: "{app}\transglass_hotkeys.json"
 Type: files; Name: "{app}\transglass.manifest"
 Type: dirifempty; Name: "{app}"
-
-[Code]
-// 这里可以添加更复杂的 Pascal 脚本，例如检查进程是否正在运行
-function InitializeSetup(): Boolean;
-var
-  ErrorCode: Integer;
-begin
-  Result := True;
-  // 可以在此处添加安装前的环境检查
-end;
