@@ -174,7 +174,7 @@ fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
     println!("当前版本 {}", current);
     let status = Update::configure()
         .repo_owner("railgun-1145")
-        .repo_name("-")
+        .repo_name("TransGlass")
         .bin_name("transglass")
         .show_download_progress(true)
         .current_version(current)
