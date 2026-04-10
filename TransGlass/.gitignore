@@ -1,4 +1,3 @@
-/target
-/transglass_hotkeys.json
-*.pdb
-*.exe
+/target/
+/TransGlass_Distribution/
+/*.zip
