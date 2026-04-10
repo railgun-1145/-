@@ -5,6 +5,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::thread;
+use self_update::backends::github::Update;
+use self_update::Status;
 
 // --- 核心状态注册表 ---
 pub struct WindowState {
@@ -136,6 +139,7 @@ fn main() -> Result<(), String> {
         println!("Alt + T: 开启/关闭当前窗口置顶");
         println!("Alt + R: 还原当前窗口");
         println!("Alt + Shift + R: 一键还原所有窗口");
+        println!("Alt + U: 检查并更新到最新版本");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -147,6 +151,11 @@ fn main() -> Result<(), String> {
                     3 => { toggle_topmost(hwnd); }
                     4 => { restore_window(hwnd); }
                     5 => { restore_all_windows(); }
+                    6 => { 
+                        thread::spawn(|| {
+                            let _ = run_self_update();
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -158,4 +167,22 @@ fn main() -> Result<(), String> {
         restore_all_windows();
         Ok(())
     }
+}
+
+fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("当前版本 {}", current);
+    let status = Update::configure()
+        .repo_owner("railgun-1145")
+        .repo_name("-")
+        .bin_name("transglass")
+        .show_download_progress(true)
+        .current_version(current)
+        .build()?
+        .update()?;
+    match status {
+        Status::UpToDate(version) => println!("已是最新版本 {}", version),
+        Status::Updated(version) => println!("已更新到版本 {}", version),
+    }
+    Ok(())
 }
