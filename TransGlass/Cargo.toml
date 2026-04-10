@@ -18,6 +18,8 @@ dashmap = "5.5"
 self_update = "0.39"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+eframe = "0.28" # 强大的 GUI 框架
+tray-icon = "0.19" # 系统托盘支持
 
 [build-dependencies]
 embed-manifest = "1.0"
