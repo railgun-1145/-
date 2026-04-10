@@ -26,12 +26,12 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultGroupName={#MyAppName}
-AllowNoIcons=yes
+AllowNoIcons=no
 ; 只有安装包具有数字签名时，以下两项才有意义
 ; SignedUninstaller=yes
 ; SignTool=...
 DisableDirPage=no
-DisableProgramGroupPage=no
+DisableProgramGroupPage=yes
 ShowLanguageDialog=no
 OutputBaseFilename=TransGlass_{#MyAppVersion}_Setup
 OutputDir={#MyAppSourceRoot}\dist\installer
