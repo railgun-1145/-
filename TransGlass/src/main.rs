@@ -1,6 +1,5 @@
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use dashmap::DashMap;
@@ -16,18 +15,20 @@ pub struct WindowState {
 }
 
 lazy_static! {
+    // 全局窗口状态注册表，Key 使用 isize (指针地址)
     static ref GLOBAL_REGISTRY: DashMap<isize, WindowState> = DashMap::new();
+    // 存储 WinEventHook 句柄，用于退出时清理
     static ref EVENT_HOOK: AtomicIsize = AtomicIsize::new(0);
 }
 
 // --- 底层核心逻辑 ---
 
 pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), String> {
-    if hwnd.0 == 0 { return Err("Invalid HWND".into()); }
-    let hwnd_val = hwnd.0;
+    if hwnd.0.is_null() { return Err("Invalid HWND".into()); }
+    let hwnd_val = hwnd.0 as isize;
 
     // 1. 获取或初始化状态
-    let mut state = if let Some(mut s) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
+    let mut state = if let Some(s) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
         s
     } else {
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
@@ -46,13 +47,13 @@ pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), S
     state.current_alpha = new_alpha;
 
     // 3. 应用样式
-    let mut current_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let current_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     if (current_style & WS_EX_LAYERED.0) == 0 {
-        SetWindowLongW(hwnd, GWL_EXSTYLE, (current_style | WS_EX_LAYERED.0) as i32);
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, (current_style | WS_EX_LAYERED.0) as i32);
     }
     SetLayeredWindowAttributes(hwnd, COLORREF(0), new_alpha, LWA_ALPHA).map_err(|e| e.to_string())?;
 
-    // 4. 置顶联动逻辑（根据用户选择）
+    // 4. 置顶联动逻辑
     apply_topmost_logic(hwnd, &state);
     
     println!("窗口 {:?} 透明度: {}%, 置顶状态: {}", 
@@ -60,9 +61,8 @@ pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), S
     Ok(())
 }
 
-/// 切换当前窗口的置顶偏好
 pub unsafe fn toggle_topmost(hwnd: HWND) {
-    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd.0) {
+    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&(hwnd.0 as isize)) {
         state.user_pref_topmost = !state.user_pref_topmost;
         apply_topmost_logic(hwnd, &state);
         println!("窗口 {:?} 手动置顶: {}", hwnd, state.user_pref_topmost);
@@ -71,18 +71,18 @@ pub unsafe fn toggle_topmost(hwnd: HWND) {
 
 unsafe fn apply_topmost_logic(hwnd: HWND, state: &WindowState) {
     if state.user_pref_topmost {
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).ok();
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     } else {
-        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).ok();
+        let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 }
 
 pub unsafe fn restore_window(hwnd: HWND) {
-    if let Some((_, state)) = GLOBAL_REGISTRY.remove(&hwnd.0) {
-        SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA).ok();
-        SetWindowLongW(hwnd, GWL_EXSTYLE, state.original_ex_style as i32);
+    if let Some((_, state)) = GLOBAL_REGISTRY.remove(&(hwnd.0 as isize)) {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, state.original_ex_style as i32);
         if !state.original_is_topmost {
-            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).ok();
+            let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
 }
@@ -90,8 +90,9 @@ pub unsafe fn restore_window(hwnd: HWND) {
 pub unsafe fn restore_all_windows() {
     let hwnds: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
     for hwnd_val in hwnds {
-        restore_window(HWND(hwnd_val));
+        restore_window(HWND(hwnd_val as *mut _));
     }
+    println!("所有窗口已恢复原状。");
 }
 
 // --- 事件钩子 ---
@@ -105,26 +106,36 @@ unsafe extern "system" fn win_event_proc(
     _dw_ms_event_time: u32,
 ) {
     if event == EVENT_OBJECT_DESTROY as u32 {
-        GLOBAL_REGISTRY.remove(&hwnd.0);
+        GLOBAL_REGISTRY.remove(&(hwnd.0 as isize));
     }
 }
 
 fn main() -> Result<(), String> {
     unsafe {
         // 注册热键
-        RegisterHotKey(None, 1, MOD_ALT, 0x5A).ok(); // Alt + Z (Plus Alpha)
-        RegisterHotKey(None, 2, MOD_ALT, 0x58).ok(); // Alt + X (Minus Alpha)
-        RegisterHotKey(None, 3, MOD_ALT, 0x54).ok(); // Alt + T (Toggle Topmost) - 新增
-        RegisterHotKey(None, 4, MOD_ALT, 0x52).ok(); // Alt + R (Reset current)
-        RegisterHotKey(None, 5, MOD_ALT | MOD_SHIFT, 0x52).ok(); // Alt + Shift + R (Reset all)
+        // virtual keys: Z=0x5A, X=0x58, T=0x54, R=0x52
+        RegisterHotKey(None, 1, MOD_ALT, 0x5A).map_err(|e| e.to_string())?; 
+        RegisterHotKey(None, 2, MOD_ALT, 0x58).map_err(|e| e.to_string())?; 
+        RegisterHotKey(None, 3, MOD_ALT, 0x54).map_err(|e| e.to_string())?; 
+        RegisterHotKey(None, 4, MOD_ALT, 0x52).map_err(|e| e.to_string())?; 
+        RegisterHotKey(None, 5, MOD_ALT | MOD_SHIFT, 0x52).map_err(|e| e.to_string())?; 
 
-        let hook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, None, Some(win_event_proc), 0, 0, WINEVENT_OUTOFCONTEXT);
-        EVENT_HOOK.store(hook.0, Ordering::SeqCst);
+        let hook = SetWinEventHook(
+            EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_DESTROY,
+            None,
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        EVENT_HOOK.store(hook.0 as isize, Ordering::SeqCst);
 
         println!("TransGlass 已启动。");
         println!("Alt + Z / X: 调节透明度");
         println!("Alt + T: 开启/关闭当前窗口置顶");
-        println!("Alt + R: 还原当前");
+        println!("Alt + R: 还原当前窗口");
+        println!("Alt + Shift + R: 一键还原所有窗口");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -139,11 +150,12 @@ fn main() -> Result<(), String> {
                     _ => {}
                 }
             }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
         }
-        UnhookWinEvent(hook);
+
+        let _ = UnhookWinEvent(HWINEVENTHOOK(EVENT_HOOK.load(Ordering::SeqCst) as *mut _));
         restore_all_windows();
+        Ok(())
     }
-    Ok(())
 }
