@@ -1,0 +1,3 @@
+cargo:rustc-link-arg-bins=/MANIFEST:EMBED
+cargo:rustc-link-arg-bins=/MANIFESTINPUT:\\?\E:\git ku\TransGlass\transglass.manifest
+cargo:rustc-link-arg-bins=/MANIFESTUAC:NO

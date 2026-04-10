@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::thread;
 use self_update::backends::github::Update;
 use self_update::Status;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 
 // --- 核心状态注册表 ---
 pub struct WindowState {
@@ -115,13 +118,8 @@ unsafe extern "system" fn win_event_proc(
 
 fn main() -> Result<(), String> {
     unsafe {
-        // 注册热键
-        // virtual keys: Z=0x5A, X=0x58, T=0x54, R=0x52
-        RegisterHotKey(None, 1, MOD_ALT, 0x5A).map_err(|e| e.to_string())?; 
-        RegisterHotKey(None, 2, MOD_ALT, 0x58).map_err(|e| e.to_string())?; 
-        RegisterHotKey(None, 3, MOD_ALT, 0x54).map_err(|e| e.to_string())?; 
-        RegisterHotKey(None, 4, MOD_ALT, 0x52).map_err(|e| e.to_string())?; 
-        RegisterHotKey(None, 5, MOD_ALT | MOD_SHIFT, 0x52).map_err(|e| e.to_string())?; 
+        let cfg = load_or_create_hotkey_config();
+        bind_hotkeys(&cfg);
 
         let hook = SetWinEventHook(
             EVENT_OBJECT_DESTROY,
@@ -135,11 +133,7 @@ fn main() -> Result<(), String> {
         EVENT_HOOK.store(hook.0 as isize, Ordering::SeqCst);
 
         println!("TransGlass 已启动。");
-        println!("Alt + Z / X: 调节透明度");
-        println!("Alt + T: 开启/关闭当前窗口置顶");
-        println!("Alt + R: 还原当前窗口");
-        println!("Alt + Shift + R: 一键还原所有窗口");
-        println!("Alt + U: 检查并更新到最新版本");
+        println!("热键已注册（可通过配置文件自定义并 Alt+Shift+C 重载）。");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -155,6 +149,12 @@ fn main() -> Result<(), String> {
                         thread::spawn(|| {
                             let _ = run_self_update();
                         });
+                    }
+                    7 => {
+                        let cfg = load_or_create_hotkey_config();
+                        unregister_all_hotkeys();
+                        bind_hotkeys(&cfg);
+                        println!("已重载热键配置");
                     }
                     _ => {}
                 }
@@ -185,4 +185,115 @@ fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
         Status::Updated(version) => println!("已更新到版本 {}", version),
     }
     Ok(())
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct HotkeySpec {
+    modifiers: String, // e.g., "ALT", "ALT+SHIFT"
+    key: String,       // e.g., "Z"
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct HotkeyConfig {
+    increase: HotkeySpec,
+    decrease: HotkeySpec,
+    toggle_top: HotkeySpec,
+    reset_current: HotkeySpec,
+    reset_all: HotkeySpec,
+    update: HotkeySpec,
+    reload: Option<HotkeySpec>, // 可选：重载配置
+}
+
+fn default_config() -> HotkeyConfig {
+    HotkeyConfig {
+        increase: HotkeySpec { modifiers: "ALT".into(), key: "Z".into() },
+        decrease: HotkeySpec { modifiers: "ALT".into(), key: "X".into() },
+        toggle_top: HotkeySpec { modifiers: "ALT".into(), key: "T".into() },
+        reset_current: HotkeySpec { modifiers: "ALT".into(), key: "R".into() },
+        reset_all: HotkeySpec { modifiers: "ALT+SHIFT".into(), key: "R".into() },
+        update: HotkeySpec { modifiers: "ALT".into(), key: "U".into() },
+        reload: Some(HotkeySpec { modifiers: "ALT+SHIFT".into(), key: "C".into() }),
+    }
+}
+
+fn get_config_path() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    exe.parent().unwrap_or_else(|| std::path::Path::new(".")).join("transglass_hotkeys.json")
+}
+
+fn load_or_create_hotkey_config() -> HotkeyConfig {
+    let path = get_config_path();
+    if let Ok(data) = fs::read_to_string(&path) {
+        if let Ok(cfg) = serde_json::from_str::<HotkeyConfig>(&data) {
+            return cfg;
+        }
+    }
+    let cfg = default_config();
+    let _ = fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
+    cfg
+}
+
+unsafe fn parse_modifiers(s: &str) -> HOT_KEY_MODIFIERS {
+    let mut m = HOT_KEY_MODIFIERS(0);
+    for part in s.split('+') {
+        match part.trim().to_uppercase().as_str() {
+            "ALT" => m |= MOD_ALT,
+            "CTRL" | "CONTROL" => m |= MOD_CONTROL,
+            "SHIFT" => m |= MOD_SHIFT,
+            "WIN" | "WINDOWS" => m |= MOD_WIN,
+            _ => {}
+        }
+    }
+    m
+}
+
+unsafe fn parse_vk(s: &str) -> u32 {
+    let up = s.trim().to_uppercase();
+    if up.len() == 1 {
+        let ch = up.chars().next().unwrap();
+        if ch.is_ascii_alphabetic() {
+            return ch as u32;
+        }
+        if ch.is_ascii_digit() {
+            // '0'..'9'
+            return ch as u32;
+        }
+    }
+    // 回退：尝试解析十六进制或已知名
+    match up.as_str() {
+        "F1" => 0x70, "F2" => 0x71, "F3" => 0x72, "F4" => 0x73,
+        "F5" => 0x74, "F6" => 0x75, "F7" => 0x76, "F8" => 0x77,
+        "F9" => 0x78, "F10" => 0x79, "F11" => 0x7A, "F12" => 0x7B,
+        _ => 0, // 不可用时返回 0
+    }
+}
+
+unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, name: &str) {
+    let mods = parse_modifiers(&spec.modifiers);
+    let vk = parse_vk(&spec.key);
+    if vk == 0 {
+        println!("热键 {} 配置的键值无效: {}", name, spec.key);
+        return;
+    }
+    match RegisterHotKey(None, id, mods, vk) {
+        Ok(_) => println!("已注册热键 {} -> {}+{}", name, spec.modifiers, spec.key),
+        Err(e) => println!("注册热键失败 {} ({}/{}): {}", name, spec.modifiers, spec.key, e.to_string()),
+    }
+}
+
+unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
+    try_register_hotkey(1, &cfg.increase, "Increase");
+    try_register_hotkey(2, &cfg.decrease, "Decrease");
+    try_register_hotkey(3, &cfg.toggle_top, "ToggleTopmost");
+    try_register_hotkey(4, &cfg.reset_current, "ResetCurrent");
+    try_register_hotkey(5, &cfg.reset_all, "ResetAll");
+    try_register_hotkey(6, &cfg.update, "Update");
+    let reload = cfg.reload.clone().unwrap_or(HotkeySpec { modifiers: "ALT+SHIFT".into(), key: "C".into() });
+    try_register_hotkey(7, &reload, "ReloadConfig");
+}
+
+unsafe fn unregister_all_hotkeys() {
+    for id in 1..=7 {
+        let _ = UnregisterHotKey(None, id);
+    }
 }
