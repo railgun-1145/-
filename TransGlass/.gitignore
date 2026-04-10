@@ -1,3 +1,5 @@
 /target/
 /TransGlass_Distribution/
+/.tools/
+/dist/
 /*.zip
