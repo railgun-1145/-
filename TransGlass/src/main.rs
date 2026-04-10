@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 pub struct WindowState {
     pub original_ex_style: u32,
     pub current_alpha: u8,
-    pub is_topmost: bool,
+    pub original_is_topmost: bool,
+    pub user_pref_topmost: bool, // 用户是否选择置顶
 }
 
 lazy_static! {
@@ -30,15 +31,17 @@ pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), S
         s
     } else {
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_top = (ex_style & WS_EX_TOPMOST.0) != 0;
         GLOBAL_REGISTRY.insert(hwnd_val, WindowState {
             original_ex_style: ex_style,
             current_alpha: 255,
-            is_topmost: (ex_style & WS_EX_TOPMOST.0) != 0,
+            original_is_topmost: is_top,
+            user_pref_topmost: is_top, // 初始跟随原状态
         });
         GLOBAL_REGISTRY.get_mut(&hwnd_val).unwrap()
     };
 
-    // 2. 计算新透明度 (线性调节，步进 15)
+    // 2. 计算新透明度
     let new_alpha = (state.current_alpha as i32 + delta).clamp(30, 255) as u8;
     state.current_alpha = new_alpha;
 
@@ -49,25 +52,36 @@ pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), S
     }
     SetLayeredWindowAttributes(hwnd, COLORREF(0), new_alpha, LWA_ALPHA).map_err(|e| e.to_string())?;
 
-    // 4. 置顶联动
-    if new_alpha < 255 {
+    // 4. 置顶联动逻辑（根据用户选择）
+    apply_topmost_logic(hwnd, &state);
+    
+    println!("窗口 {:?} 透明度: {}%, 置顶状态: {}", 
+             hwnd, (new_alpha as f32 / 255.0 * 100.0) as i32, state.user_pref_topmost);
+    Ok(())
+}
+
+/// 切换当前窗口的置顶偏好
+pub unsafe fn toggle_topmost(hwnd: HWND) {
+    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd.0) {
+        state.user_pref_topmost = !state.user_pref_topmost;
+        apply_topmost_logic(hwnd, &state);
+        println!("窗口 {:?} 手动置顶: {}", hwnd, state.user_pref_topmost);
+    }
+}
+
+unsafe fn apply_topmost_logic(hwnd: HWND, state: &WindowState) {
+    if state.user_pref_topmost {
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).ok();
     } else {
-        // 如果恢复到不透明，且原本不是置顶，则还原置顶状态
-        if !state.is_topmost {
-            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).ok();
-        }
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).ok();
     }
-    
-    println!("窗口 {:?} 透明度调节至: {}%", hwnd, (new_alpha as f32 / 255.0 * 100.0) as i32);
-    Ok(())
 }
 
 pub unsafe fn restore_window(hwnd: HWND) {
     if let Some((_, state)) = GLOBAL_REGISTRY.remove(&hwnd.0) {
         SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA).ok();
         SetWindowLongW(hwnd, GWL_EXSTYLE, state.original_ex_style as i32);
-        if !state.is_topmost {
+        if !state.original_is_topmost {
             SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).ok();
         }
     }
@@ -78,11 +92,9 @@ pub unsafe fn restore_all_windows() {
     for hwnd_val in hwnds {
         restore_window(HWND(hwnd_val));
     }
-    println!("所有窗口已恢复原状。");
 }
 
-// --- 事件回调与热键 ---
-
+// --- 事件钩子 ---
 unsafe extern "system" fn win_event_proc(
     _h_win_event_hook: HWINEVENTHOOK,
     event: u32,
@@ -99,49 +111,37 @@ unsafe extern "system" fn win_event_proc(
 
 fn main() -> Result<(), String> {
     unsafe {
-        // 1. 注册全局热键
-        // Alt + Z (增加透明度), Alt + X (减少透明度), Alt + R (重置当前), Alt + Shift + R (重置所有)
-        RegisterHotKey(None, 1, MOD_ALT, 0x5A).map_err(|e| e.to_string())?; // Alt + Z (Plus)
-        RegisterHotKey(None, 2, MOD_ALT, 0x58).map_err(|e| e.to_string())?; // Alt + X (Minus)
-        RegisterHotKey(None, 3, MOD_ALT, 0x52).map_err(|e| e.to_string())?; // Alt + R (Reset current)
-        RegisterHotKey(None, 4, MOD_ALT | MOD_SHIFT, 0x52).map_err(|e| e.to_string())?; // Alt + Shift + R (Reset all)
+        // 注册热键
+        RegisterHotKey(None, 1, MOD_ALT, 0x5A).ok(); // Alt + Z (Plus Alpha)
+        RegisterHotKey(None, 2, MOD_ALT, 0x58).ok(); // Alt + X (Minus Alpha)
+        RegisterHotKey(None, 3, MOD_ALT, 0x54).ok(); // Alt + T (Toggle Topmost) - 新增
+        RegisterHotKey(None, 4, MOD_ALT, 0x52).ok(); // Alt + R (Reset current)
+        RegisterHotKey(None, 5, MOD_ALT | MOD_SHIFT, 0x52).ok(); // Alt + Shift + R (Reset all)
 
-        // 2. 设置窗口事件钩子
-        let hook = SetWinEventHook(
-            EVENT_OBJECT_DESTROY,
-            EVENT_OBJECT_DESTROY,
-            None,
-            Some(win_event_proc),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT,
-        );
+        let hook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, None, Some(win_event_proc), 0, 0, WINEVENT_OUTOFCONTEXT);
         EVENT_HOOK.store(hook.0, Ordering::SeqCst);
 
         println!("TransGlass 已启动。");
-        println!("Alt + Z: 增加当前窗口透明度 (线性调节)");
-        println!("Alt + X: 减少当前窗口透明度");
-        println!("Alt + R: 还原当前窗口");
-        println!("Alt + Shift + R: 一键还原所有窗口");
+        println!("Alt + Z / X: 调节透明度");
+        println!("Alt + T: 开启/关闭当前窗口置顶");
+        println!("Alt + R: 还原当前");
 
-        // 3. 消息循环
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_HOTKEY {
                 let hwnd = GetForegroundWindow();
                 match msg.wParam.0 as i32 {
-                    1 => { let _ = adjust_window_transparency(hwnd, -25); } // 增加透明 (减 Alpha)
-                    2 => { let _ = adjust_window_transparency(hwnd, 25); }  // 减少透明 (加 Alpha)
-                    3 => { restore_window(hwnd); }
-                    4 => { restore_all_windows(); }
+                    1 => { let _ = adjust_window_transparency(hwnd, -25); }
+                    2 => { let _ = adjust_window_transparency(hwnd, 25); }
+                    3 => { toggle_topmost(hwnd); }
+                    4 => { restore_window(hwnd); }
+                    5 => { restore_all_windows(); }
                     _ => {}
                 }
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-
-        // 4. 清理
         UnhookWinEvent(hook);
         restore_all_windows();
     }
