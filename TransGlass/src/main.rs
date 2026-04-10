@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::UI::Accessibility::*;
@@ -128,43 +130,78 @@ unsafe extern "system" fn win_event_proc(
 // --- GUI 应用程序 ---
 struct TransGlassApp {
     config: HotkeyConfig,
+    should_exit: bool,
 }
 
 impl TransGlassApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // 仿 Trae 风格的深色 UI
+        // 1. 设置中文字体 (尝试多个常用路径)
+        let mut fonts = egui::FontDefinitions::default();
+        let font_paths = [
+            "C:\\Windows\\Fonts\\msyh.ttc",   // 微软雅黑
+            "C:\\Windows\\Fonts\\msyh.ttf",
+            "C:\\Windows\\Fonts\\simsun.ttc", // 宋体
+            "C:\\Windows\\Fonts\\simsun.ttf",
+        ];
+        
+        let mut font_loaded = false;
+        for path in font_paths {
+            if let Ok(font_data) = std::fs::read(path) {
+                fonts.font_data.insert(
+                    "my_font".to_owned(),
+                    egui::FontData::from_owned(font_data),
+                );
+                fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap()
+                    .insert(0, "my_font".to_owned());
+                fonts.families.get_mut(&egui::FontFamily::Monospace).unwrap()
+                    .push("my_font".to_owned());
+                font_loaded = true;
+                break;
+            }
+        }
+        
+        if !font_loaded {
+            // 如果系统字体加载失败，记录日志或通过 label 提示
+            eprintln!("Warning: Failed to load system Chinese fonts.");
+        }
+        cc.egui_ctx.set_fonts(fonts);
+
+        // 2. 仿 Trae 风格的深色 UI
         let mut visuals = egui::Visuals::dark();
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(30, 30, 30);
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 45, 45);
+        visuals.panel_fill = egui::Color32::from_rgb(18, 18, 18);
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 24, 24);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(32, 32, 32);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 45, 45);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(55, 55, 55);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 150, 255);
+        visuals.window_rounding = egui::Rounding::same(8.0);
         cc.egui_ctx.set_visuals(visuals);
         
         Self {
             config: load_or_create_hotkey_config(),
+            should_exit: false,
         }
     }
 }
 
 impl eframe::App for TransGlassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. 处理托盘事件
+        // 1. 处理托盘和菜单事件 (逻辑保持不变)
         if let Ok(event) = TrayIconEvent::receiver().try_recv() {
             if event.button == MouseButton::Left {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
-
-        // 2. 处理菜单事件
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             match event.id.0.as_str() {
                 "show" => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                "reset_all" => {
-                    unsafe { restore_all_windows(); }
-                }
+                "reset_all" => { unsafe { restore_all_windows(); } }
                 "exit" => {
+                    self.should_exit = true;
                     unsafe { restore_all_windows(); }
                     std::process::exit(0);
                 }
@@ -172,85 +209,113 @@ impl eframe::App for TransGlassApp {
             }
         }
 
-        // 3. 拦截关闭按钮：隐藏到托盘而非退出
+        // 2. 拦截关闭
         if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.should_exit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         }
 
-        // 4. UI 绘制 (仿 Trae 简洁风格)
+        // 3. UI 绘制 (更简洁现代的布局)
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(5.0);
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.heading("TransGlass");
+                ui.heading(egui::RichText::new("TransGlass").color(egui::Color32::from_rgb(0, 150, 255)).strong().size(22.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("隐藏").clicked() {
+                    if ui.button(" 🗙 隐藏 ").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     }
                 });
             });
+            ui.add_space(10.0);
             ui.separator();
             ui.add_space(10.0);
 
-            // 窗口列表区
-            ui.label(egui::RichText::new("管理中的窗口").strong());
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                if GLOBAL_REGISTRY.is_empty() {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        ui.label(egui::RichText::new("暂无已调节窗口\n使用 Alt+Z/X 开始调节").weak());
-                    });
-                }
+            // 正在管理的窗口
+            ui.label(egui::RichText::new("已调节的窗口").strong().color(egui::Color32::LIGHT_GRAY));
+            ui.add_space(5.0);
 
-                let mut to_restore = None;
-                for mut entry in GLOBAL_REGISTRY.iter_mut() {
-                    let hwnd_val = *entry.key();
-                    let state = entry.value_mut();
-                    
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&state.title).truncate());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("还原").clicked() {
-                                    to_restore = Some(hwnd_val);
-                                }
+            egui::ScrollArea::vertical()
+                .max_height(250.0)
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    if GLOBAL_REGISTRY.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(60.0);
+                            ui.label(egui::RichText::new("暂无管理记录\n使用热键开始管理").weak());
+                        });
+                    }
+
+                    let mut to_restore = None;
+                    for mut entry in GLOBAL_REGISTRY.iter_mut() {
+                        let hwnd_val = *entry.key();
+                        let state = entry.value_mut();
+                        
+                        ui.add_space(4.0);
+                        ui.group(|ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&state.title).truncate().strong().size(14.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("还原").clicked() {
+                                            to_restore = Some(hwnd_val);
+                                        }
+                                    });
+                                });
+                                
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("透明度:");
+                                    let mut alpha_f32 = state.current_alpha as f32;
+                                    let slider = egui::Slider::new(&mut alpha_f32, 30.0..=255.0)
+                                        .show_value(false)
+                                        .trailing_fill(true);
+                                    if ui.add(slider).changed() {
+                                        state.current_alpha = alpha_f32 as u8;
+                                        unsafe {
+                                            let _ = apply_transparency_to_hwnd(HWND(hwnd_val as *mut _), state.current_alpha, state.user_pref_topmost);
+                                        }
+                                    }
+                                    ui.add_space(10.0);
+                                    if ui.checkbox(&mut state.user_pref_topmost, "置顶").changed() {
+                                        unsafe {
+                                            let _ = apply_transparency_to_hwnd(HWND(hwnd_val as *mut _), state.current_alpha, state.user_pref_topmost);
+                                        }
+                                    }
+                                });
                             });
                         });
-                        ui.horizontal(|ui| {
-                            let mut alpha_f32 = state.current_alpha as f32;
-                            ui.label("透明");
-                            if ui.add(egui::Slider::new(&mut alpha_f32, 30.0..=255.0).show_value(false)).changed() {
-                                state.current_alpha = alpha_f32 as u8;
-                                unsafe {
-                                    let _ = apply_transparency_to_hwnd(HWND(hwnd_val as *mut _), state.current_alpha, state.user_pref_topmost);
-                                }
-                            }
-                            ui.checkbox(&mut state.user_pref_topmost, "置顶");
-                        });
-                    });
-                }
-                if let Some(h) = to_restore {
-                    unsafe { restore_window(HWND(h as *mut _)); }
-                }
-            });
+                    }
+                    if let Some(h) = to_restore {
+                        unsafe { restore_window(HWND(h as *mut _)); }
+                    }
+                });
 
             ui.add_space(15.0);
             ui.separator();
+            ui.add_space(10.0);
             
-            // 底部操作区
+            // 底部控制
             ui.horizontal(|ui| {
-                if ui.button("♻️ 全部还原").clicked() {
+                if ui.button("♻ 全部还原").clicked() {
                     unsafe { restore_all_windows(); }
                 }
-                if ui.button("🚀 检查更新").clicked() {
-                    thread::spawn(|| { let _ = run_self_update(); });
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("🚀 检查更新").clicked() {
+                        thread::spawn(|| { let _ = run_self_update(); });
+                    }
+                });
             });
             
-            ui.add_space(5.0);
-            ui.label(egui::RichText::new("快捷键: Alt+Z/X (透明) | Alt+T (置顶)").small().weak());
+            ui.add_space(12.0);
+            ui.group(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("快捷键提示").strong().size(12.0));
+                    ui.label(egui::RichText::new("Alt + Z/X: 调节透明度 | Alt + T: 窗口置顶\nAlt + R: 还原当前窗口 | Alt + Shift + R: 还原全部").small().weak());
+                });
+            });
             
-            // 实时重绘确保热键同步
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         });
     }
@@ -258,8 +323,8 @@ impl eframe::App for TransGlassApp {
 
 fn create_tray_icon() -> TrayIcon {
     let tray_menu = Menu::new();
-    let show_item = MenuItem::with_id("show", "显示控制面板", true, None);
-    let reset_all_item = MenuItem::with_id("reset_all", "全部还原", true, None);
+    let show_item = MenuItem::with_id("show", "打开 TransGlass", true, None);
+    let reset_all_item = MenuItem::with_id("reset_all", "全部窗口还原", true, None);
     let exit_item = MenuItem::with_id("exit", "退出程序", true, None);
     
     let _ = tray_menu.append_items(&[
@@ -270,12 +335,14 @@ fn create_tray_icon() -> TrayIcon {
         &exit_item,
     ]);
 
-    // 创建一个简单的图标 (RGBA 32x32)
-    let mut rgba = Vec::with_capacity(32 * 32 * 4);
-    for _ in 0..(32 * 32) {
-        rgba.extend_from_slice(&[30, 144, 255, 255]); // 道奇蓝
-    }
-    let icon = tray_icon::Icon::from_rgba(rgba, 32, 32).unwrap();
+    // 加载自定义图标
+    let icon = load_custom_icon().unwrap_or_else(|| {
+        let mut rgba = Vec::with_capacity(32 * 32 * 4);
+        for _ in 0..(32 * 32) {
+            rgba.extend_from_slice(&[0, 150, 255, 255]);
+        }
+        tray_icon::Icon::from_rgba(rgba, 32, 32).unwrap()
+    });
 
     TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
@@ -285,11 +352,30 @@ fn create_tray_icon() -> TrayIcon {
         .unwrap()
 }
 
+fn load_custom_icon() -> Option<tray_icon::Icon> {
+    // 优先级：icon2.png (用户指定的第二张图片) -> icon.png -> tray_icon.png
+    let paths = [
+        "icon2.png", 
+        "icon.png", 
+        "tray_icon.png", 
+        "TransGlass_Distribution/icon2.png",
+        "TransGlass_Distribution/icon.png"
+    ];
+    for path in paths {
+        if let Ok(img) = image::open(path) {
+            let rgba = img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.into_raw(), width, height) {
+                return Some(icon);
+            }
+        }
+    }
+    None
+}
+
 fn main() -> Result<(), eframe::Error> {
-    // 启动托盘图标 (生命周期随 main)
     let _tray_icon = create_tray_icon();
 
-    // 启动热键监听线程
     thread::spawn(|| {
         unsafe {
             let cfg = load_or_create_hotkey_config();
@@ -333,7 +419,6 @@ fn main() -> Result<(), eframe::Error> {
         }
     });
 
-    // 启动 GUI
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([320.0, 450.0])
