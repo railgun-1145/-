@@ -8,7 +8,8 @@ use self_update::backends::github::Update;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::thread;
@@ -36,6 +37,7 @@ struct WindowState {
 lazy_static! {
     static ref GLOBAL_REGISTRY: DashMap<isize, WindowState> = DashMap::new();
     static ref MOUSE_BINDINGS: RwLock<MouseBindings> = RwLock::new(MouseBindings::default());
+    static ref PASSTHROUGH_DRAG: Mutex<Option<PassthroughDragState>> = Mutex::new(None);
 }
 
 #[derive(Clone, Copy)]
@@ -47,11 +49,25 @@ struct PendingChange {
     pen_passthrough: Option<bool>,
 }
 
+/// 部分点透模式下，由本程序接管的按下拖拽序列（用于转发 MOVE / UP）。
+#[derive(Clone, Copy)]
+struct PassthroughDragState {
+    root_val: isize,
+    buttons: u8,
+}
+
+const WM_TRANSGLASS_SHUTDOWN: u32 = WM_USER + 88;
+const DRAG_BTN_LEFT: u8 = 1;
+const DRAG_BTN_RIGHT: u8 = 2;
+const DRAG_BTN_MIDDLE: u8 = 4;
+
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
 static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
 static EXITING: AtomicBool = AtomicBool::new(false);
 static ROOT_HWND: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+static MOUSE_HOOK_FAILED: AtomicBool = AtomicBool::new(false);
+static HOTKEY_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,144 +135,307 @@ fn set_mouse_bindings(cfg: &HotkeyConfig) {
     }
 }
 
+struct ExStyleGuard {
+    hwnd: HWND,
+    orig: u32,
+}
+
+impl ExStyleGuard {
+    unsafe fn add_transparent(hwnd: HWND) -> Self {
+        let orig = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, (orig | WS_EX_TRANSPARENT.0) as i32);
+        Self { hwnd, orig }
+    }
+}
+
+impl Drop for ExStyleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetWindowLongW(self.hwnd, GWL_EXSTYLE, self.orig as i32);
+        }
+    }
+}
+
+unsafe fn screen_metrics() -> (i32, i32) {
+    let cx = (GetSystemMetrics(SM_CXSCREEN) - 1).max(1);
+    let cy = (GetSystemMetrics(SM_CYSCREEN) - 1).max(1);
+    (cx, cy)
+}
+
+fn button_drag_mask(msg: u32) -> Option<u8> {
+    match msg {
+        WM_LBUTTONDOWN | WM_LBUTTONUP => Some(DRAG_BTN_LEFT),
+        WM_RBUTTONDOWN | WM_RBUTTONUP => Some(DRAG_BTN_RIGHT),
+        WM_MBUTTONDOWN | WM_MBUTTONUP => Some(DRAG_BTN_MIDDLE),
+        _ => None,
+    }
+}
+
+fn is_button_down_msg(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
+    )
+}
+
+fn is_button_up_msg(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP
+    )
+}
+
+unsafe fn inject_mouse_button_at_pt(pt: POINT, msg: u32) -> bool {
+    let (cx, cy) = screen_metrics();
+    let btn = match msg {
+        WM_LBUTTONDOWN => MOUSEEVENTF_LEFTDOWN,
+        WM_LBUTTONUP => MOUSEEVENTF_LEFTUP,
+        WM_RBUTTONDOWN => MOUSEEVENTF_RIGHTDOWN,
+        WM_RBUTTONUP => MOUSEEVENTF_RIGHTUP,
+        WM_MBUTTONDOWN => MOUSEEVENTF_MIDDLEDOWN,
+        WM_MBUTTONUP => MOUSEEVENTF_MIDDLEUP,
+        _ => MOUSE_EVENT_FLAGS(0),
+    };
+    let flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | btn;
+    let inp = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: (pt.x * 65535) / cx,
+                dy: (pt.y * 65535) / cy,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: TRANSG_GLASS_INJECT_EXTRA_INFO,
+            },
+        },
+    };
+    SendInput(&[inp], std::mem::size_of::<INPUT>() as i32) != 0
+}
+
+unsafe fn inject_mouse_move_at_pt(pt: POINT) -> bool {
+    let (cx, cy) = screen_metrics();
+    let inp = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: (pt.x * 65535) / cx,
+                dy: (pt.y * 65535) / cy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: TRANSG_GLASS_INJECT_EXTRA_INFO,
+            },
+        },
+    };
+    SendInput(&[inp], std::mem::size_of::<INPUT>() as i32) != 0
+}
+
+unsafe fn inject_mouse_wheel_delta(wheel_delta: i32) -> bool {
+    let inp = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: wheel_delta as u32,
+                dwFlags: MOUSEEVENTF_WHEEL,
+                time: 0,
+                dwExtraInfo: TRANSG_GLASS_INJECT_EXTRA_INFO,
+            },
+        },
+    };
+    SendInput(&[inp], std::mem::size_of::<INPUT>() as i32) != 0
+}
+
 unsafe fn install_mouse_hook() {
     if MOUSE_HOOK.load(Ordering::SeqCst) != 0 {
         return;
     }
-    let hook = SetWindowsHookExW(
+    match SetWindowsHookExW(
         WH_MOUSE_LL,
         Some(mouse_hook_proc),
         HINSTANCE(std::ptr::null_mut()),
         0,
-    );
-    if let Ok(hook) = hook {
-        if !hook.0.is_null() {
+    ) {
+        Ok(hook) if !hook.0.is_null() => {
             MOUSE_HOOK.store(hook.0 as isize, Ordering::SeqCst);
+        }
+        _ => {
+            MOUSE_HOOK_FAILED.store(true, Ordering::SeqCst);
         }
     }
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 {
-        let msg = wparam.0 as u32;
-        let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
-        if info.dwExtraInfo == TRANSG_GLASS_INJECT_EXTRA_INFO {
-            return CallNextHookEx(
-                HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
-                code,
-                wparam,
-                lparam,
-            );
-        }
+    if code != HC_ACTION as i32 {
+        return CallNextHookEx(
+            HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+            code,
+            wparam,
+            lparam,
+        );
+    }
 
-        if msg == WM_XBUTTONDOWN {
-            let button = ((info.mouseData >> 16) & 0xffff) as u16;
-            let action = if let Ok(r) = MOUSE_BINDINGS.read() {
-                match button {
-                    1 => r.xbutton1,
-                    2 => r.xbutton2,
-                    _ => MouseAction::None,
-                }
-            } else {
-                MouseAction::None
-            };
-            if action != MouseAction::None {
-                let hwnd = GetForegroundWindow();
-                match action {
-                    MouseAction::Increase => {
-                        let _ = adjust_window_transparency(hwnd, 25);
-                    }
-                    MouseAction::Decrease => {
-                        let _ = adjust_window_transparency(hwnd, -25);
-                    }
-                    MouseAction::ToggleTopmost => {
-                        toggle_topmost(hwnd);
-                    }
-                    MouseAction::ToggleClickThrough => {
-                        toggle_mouse_passthrough(hwnd);
-                    }
-                    MouseAction::TogglePenPassthrough => {
-                        toggle_pen_passthrough(hwnd);
-                    }
-                    MouseAction::ResetCurrent => {
-                        restore_window(hwnd);
-                    }
-                    MouseAction::ResetAll => {
-                        restore_all_windows();
-                    }
-                    MouseAction::Update => {
-                        thread::spawn(|| {
-                            let _ = run_self_update();
-                        });
-                    }
-                    MouseAction::None => {}
-                }
-            }
-        } else if matches!(
-            msg,
-            WM_LBUTTONDOWN
-                | WM_LBUTTONUP
-                | WM_RBUTTONDOWN
-                | WM_RBUTTONUP
-                | WM_MBUTTONDOWN
-                | WM_MBUTTONUP
-        ) {
-            let pt = POINT {
-                x: info.pt.x,
-                y: info.pt.y,
-            };
-            let hit = WindowFromPoint(pt);
-            if !hit.0.is_null() {
-                let root = GetAncestor(hit, GA_ROOT);
-                let root_val = root.0 as isize;
-                if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
-                    let is_pen = (info.dwExtraInfo & 0xFFFFFF00) == 0xFF515700;
-                    let wants = if is_pen {
-                        state.pen_passthrough
-                    } else {
-                        state.mouse_passthrough
-                    };
-                    let all = state.mouse_passthrough && state.pen_passthrough;
-                    if wants && !all {
-                        let orig = GetWindowLongW(root, GWL_EXSTYLE) as u32;
-                        let _ =
-                            SetWindowLongW(root, GWL_EXSTYLE, (orig | WS_EX_TRANSPARENT.0) as i32);
+    let msg = wparam.0 as u32;
+    let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
 
-                        let cx = (GetSystemMetrics(SM_CXSCREEN) - 1).max(1);
-                        let cy = (GetSystemMetrics(SM_CYSCREEN) - 1).max(1);
-                        let flags = MOUSEEVENTF_ABSOLUTE
-                            | MOUSEEVENTF_MOVE
-                            | match msg {
-                                WM_LBUTTONDOWN => MOUSEEVENTF_LEFTDOWN,
-                                WM_LBUTTONUP => MOUSEEVENTF_LEFTUP,
-                                WM_RBUTTONDOWN => MOUSEEVENTF_RIGHTDOWN,
-                                WM_RBUTTONUP => MOUSEEVENTF_RIGHTUP,
-                                WM_MBUTTONDOWN => MOUSEEVENTF_MIDDLEDOWN,
-                                WM_MBUTTONUP => MOUSEEVENTF_MIDDLEUP,
-                                _ => MOUSE_EVENT_FLAGS(0),
-                            };
-                        let inp = INPUT {
-                            r#type: INPUT_MOUSE,
-                            Anonymous: INPUT_0 {
-                                mi: MOUSEINPUT {
-                                    dx: (pt.x * 65535) / cx,
-                                    dy: (pt.y * 65535) / cy,
-                                    mouseData: 0,
-                                    dwFlags: flags,
-                                    time: 0,
-                                    dwExtraInfo: TRANSG_GLASS_INJECT_EXTRA_INFO,
-                                },
-                            },
-                        };
-                        let _ = SendInput(&[inp], std::mem::size_of::<INPUT>() as i32);
+    if info.dwExtraInfo == TRANSG_GLASS_INJECT_EXTRA_INFO {
+        return CallNextHookEx(
+            HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+            code,
+            wparam,
+            lparam,
+        );
+    }
 
-                        let _ = SetWindowLongW(root, GWL_EXSTYLE, orig as i32);
+    let pt = POINT {
+        x: info.pt.x,
+        y: info.pt.y,
+    };
+
+    // 结束由本程序接管的拖拽：注入 UP 并清理状态
+    if is_button_up_msg(msg) {
+        if let Some(mask) = button_drag_mask(msg) {
+            if let Ok(mut guard) = PASSTHROUGH_DRAG.lock() {
+                if let Some(ref mut st) = *guard {
+                    if st.buttons & mask != 0 {
+                        let root = HWND(st.root_val as *mut _);
+                        let _g = ExStyleGuard::add_transparent(root);
+                        let _ = inject_mouse_button_at_pt(pt, msg);
+                        st.buttons &= !mask;
+                        if st.buttons == 0 {
+                            *guard = None;
+                        }
                         return LRESULT(1);
                     }
                 }
             }
         }
     }
+
+    // 拖拽中的移动：持续注入到下层，直到对应按键释放
+    if msg == WM_MOUSEMOVE {
+        if let Ok(guard) = PASSTHROUGH_DRAG.lock() {
+            if let Some(ref st) = *guard {
+                if st.buttons != 0 {
+                    let _ = inject_mouse_move_at_pt(pt);
+                    return LRESULT(1);
+                }
+            }
+        }
+    }
+
+    if msg == WM_XBUTTONDOWN {
+        let button = ((info.mouseData >> 16) & 0xffff) as u16;
+        let action = if let Ok(r) = MOUSE_BINDINGS.read() {
+            match button {
+                1 => r.xbutton1,
+                2 => r.xbutton2,
+                _ => MouseAction::None,
+            }
+        } else {
+            MouseAction::None
+        };
+        if action != MouseAction::None {
+            let hwnd = GetForegroundWindow();
+            match action {
+                MouseAction::Increase => {
+                    let _ = adjust_window_transparency(hwnd, 25);
+                }
+                MouseAction::Decrease => {
+                    let _ = adjust_window_transparency(hwnd, -25);
+                }
+                MouseAction::ToggleTopmost => {
+                    toggle_topmost(hwnd);
+                }
+                MouseAction::ToggleClickThrough => {
+                    toggle_mouse_passthrough(hwnd);
+                }
+                MouseAction::TogglePenPassthrough => {
+                    toggle_pen_passthrough(hwnd);
+                }
+                MouseAction::ResetCurrent => {
+                    restore_window(hwnd);
+                }
+                MouseAction::ResetAll => {
+                    restore_all_windows();
+                }
+                MouseAction::Update => {
+                    thread::spawn(|| {
+                        let _ = run_self_update();
+                    });
+                }
+                MouseAction::None => {}
+            }
+            return LRESULT(1);
+        }
+    }
+
+    if msg == WM_MOUSEWHEEL {
+        let hit = WindowFromPoint(pt);
+        if !hit.0.is_null() {
+            let root = GetAncestor(hit, GA_ROOT);
+            let root_val = root.0 as isize;
+            if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
+                let all = state.mouse_passthrough && state.pen_passthrough;
+                if state.mouse_passthrough && !all {
+                    let delta =
+                        (((info.mouseData >> 16) & 0xFFFF) as u16 as i16) as i32;
+                    let _g = ExStyleGuard::add_transparent(root);
+                    let _ = inject_mouse_wheel_delta(delta);
+                    return LRESULT(1);
+                }
+            }
+        }
+    }
+
+    if matches!(
+        msg,
+        WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
+    ) {
+        let hit = WindowFromPoint(pt);
+        if !hit.0.is_null() {
+            let root = GetAncestor(hit, GA_ROOT);
+            let root_val = root.0 as isize;
+            if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
+                let is_pen = (info.dwExtraInfo & 0xFFFFFF00) == 0xFF515700;
+                let wants = if is_pen {
+                    state.pen_passthrough
+                } else {
+                    state.mouse_passthrough
+                };
+                let all = state.mouse_passthrough && state.pen_passthrough;
+                if wants && !all && is_button_down_msg(msg) {
+                    let _g = ExStyleGuard::add_transparent(root);
+                    if inject_mouse_button_at_pt(pt, msg) {
+                        if let Some(mask) = button_drag_mask(msg) {
+                            if let Ok(mut g) = PASSTHROUGH_DRAG.lock() {
+                                match *g {
+                                    Some(ref mut st) if st.root_val == root_val => {
+                                        st.buttons |= mask;
+                                    }
+                                    _ => {
+                                        *g = Some(PassthroughDragState {
+                                            root_val,
+                                            buttons: mask,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        return LRESULT(1);
+                    }
+                }
+            }
+        }
+    }
+
     CallNextHookEx(
         HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
         code,
@@ -404,7 +583,25 @@ unsafe fn toggle_topmost(hwnd: HWND) {
     if is_own_hwnd(hwnd) {
         return;
     }
-    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&(hwnd.0 as isize)) {
+    let hwnd_val = hwnd.0 as isize;
+    if GLOBAL_REGISTRY.get(&hwnd_val).is_none() {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_top = (ex_style & WS_EX_TOPMOST.0) != 0;
+        let title = get_window_title(hwnd);
+        GLOBAL_REGISTRY.insert(
+            hwnd_val,
+            WindowState {
+                original_ex_style: ex_style,
+                current_alpha: 255,
+                original_is_topmost: is_top,
+                user_pref_topmost: is_top,
+                mouse_passthrough: false,
+                pen_passthrough: false,
+                title,
+            },
+        );
+    }
+    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
         state.user_pref_topmost = !state.user_pref_topmost;
         let _ = apply_transparency_to_hwnd(
             hwnd,
@@ -497,7 +694,15 @@ unsafe fn restore_window(hwnd: HWND) {
     if hwnd.0.is_null() {
         return;
     }
-    if let Some((_, state)) = GLOBAL_REGISTRY.remove(&(hwnd.0 as isize)) {
+    let v = hwnd.0 as isize;
+    if let Ok(mut g) = PASSTHROUGH_DRAG.lock() {
+        if let Some(st) = *g {
+            if st.root_val == v {
+                *g = None;
+            }
+        }
+    }
+    if let Some((_, state)) = GLOBAL_REGISTRY.remove(&v) {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, state.original_ex_style as i32);
         if !state.original_is_topmost {
@@ -516,6 +721,9 @@ unsafe fn restore_window(hwnd: HWND) {
 }
 
 unsafe fn restore_all_windows() {
+    if let Ok(mut g) = PASSTHROUGH_DRAG.lock() {
+        *g = None;
+    }
     let hwnds: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
     for hwnd_val in hwnds {
         restore_window(HWND(hwnd_val as *mut _));
@@ -622,6 +830,16 @@ impl eframe::App for TransGlassApp {
                     }
                 });
             });
+            if MOUSE_HOOK_FAILED.load(Ordering::Relaxed) {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "警告：低级鼠标钩子未能安装，「仅鼠标/仅笔点透」模式将无法工作（双点透全开仍可用）。",
+                    )
+                    .color(egui::Color32::from_rgb(255, 170, 70))
+                    .small(),
+                );
+            }
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(10.0);
@@ -884,8 +1102,15 @@ fn main() -> Result<(), eframe::Error> {
                         continue;
                     }
                     unsafe { restore_all_windows() };
-                    thread::sleep(std::time::Duration::from_millis(150));
-                    unsafe { ExitProcess(0) };
+                    let tid = HOTKEY_THREAD_ID.load(Ordering::SeqCst);
+                    if tid != 0 {
+                        unsafe {
+                            let _ = PostThreadMessageW(tid, WM_TRANSGLASS_SHUTDOWN, WPARAM(0), LPARAM(0));
+                        }
+                    } else {
+                        thread::sleep(std::time::Duration::from_millis(120));
+                        unsafe { ExitProcess(0) };
+                    }
                 }
                 _ => {}
             }
@@ -912,6 +1137,8 @@ fn main() -> Result<(), eframe::Error> {
     let _tray_icon = create_tray_icon();
 
     thread::spawn(|| unsafe {
+        HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+
         let cfg = load_or_create_hotkey_config();
         set_mouse_bindings(&cfg);
         bind_hotkeys(&cfg);
@@ -919,6 +1146,15 @@ fn main() -> Result<(), eframe::Error> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_TRANSGLASS_SHUTDOWN {
+                let h = MOUSE_HOOK.swap(0, Ordering::SeqCst);
+                if h != 0 {
+                    let _ = UnhookWindowsHookEx(HHOOK(h as *mut _));
+                }
+                unregister_all_hotkeys();
+                restore_all_windows();
+                ExitProcess(0);
+            }
             if msg.message == WM_HOTKEY {
                 let hwnd = GetForegroundWindow();
                 match msg.wParam.0 as i32 {
@@ -960,6 +1196,11 @@ fn main() -> Result<(), eframe::Error> {
             let _ = TranslateMessage(&msg);
             let _ = DispatchMessageW(&msg);
         }
+        let h = MOUSE_HOOK.swap(0, Ordering::SeqCst);
+        if h != 0 {
+            let _ = UnhookWindowsHookEx(HHOOK(h as *mut _));
+        }
+        unregister_all_hotkeys();
         restore_all_windows();
     });
 
