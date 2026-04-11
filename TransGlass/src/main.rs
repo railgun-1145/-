@@ -28,7 +28,8 @@ struct WindowState {
     current_alpha: u8,
     original_is_topmost: bool,
     user_pref_topmost: bool,
-    click_through: bool,
+    mouse_passthrough: bool,
+    pen_passthrough: bool,
     title: String,
 }
 
@@ -37,11 +38,21 @@ lazy_static! {
     static ref MOUSE_BINDINGS: RwLock<MouseBindings> = RwLock::new(MouseBindings::default());
 }
 
+#[derive(Clone, Copy)]
+struct PendingChange {
+    hwnd_val: isize,
+    alpha: Option<u8>,
+    topmost: Option<bool>,
+    mouse_passthrough: Option<bool>,
+    pen_passthrough: Option<bool>,
+}
+
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
 static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
 static EXITING: AtomicBool = AtomicBool::new(false);
 static ROOT_HWND: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MouseAction {
@@ -50,6 +61,7 @@ enum MouseAction {
     Decrease,
     ToggleTopmost,
     ToggleClickThrough,
+    TogglePenPassthrough,
     ResetCurrent,
     ResetAll,
     Update,
@@ -81,7 +93,10 @@ fn parse_mouse_action(s: &str) -> MouseAction {
         "increase" | "inc" | "up" => MouseAction::Increase,
         "decrease" | "dec" | "down" => MouseAction::Decrease,
         "toggle_topmost" | "topmost" | "toggle_top" => MouseAction::ToggleTopmost,
-        "toggle_click_through" | "click_through" | "toggle_click" => MouseAction::ToggleClickThrough,
+        "toggle_click_through" | "toggle_mouse_passthrough" | "click_through" | "toggle_click" => {
+            MouseAction::ToggleClickThrough
+        }
+        "toggle_pen_passthrough" | "pen_passthrough" => MouseAction::TogglePenPassthrough,
         "reset_current" | "reset" => MouseAction::ResetCurrent,
         "reset_all" => MouseAction::ResetAll,
         "update" => MouseAction::Update,
@@ -124,8 +139,17 @@ unsafe fn install_mouse_hook() {
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let msg = wparam.0 as u32;
+        let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
+        if info.dwExtraInfo == TRANSG_GLASS_INJECT_EXTRA_INFO {
+            return CallNextHookEx(
+                HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                code,
+                wparam,
+                lparam,
+            );
+        }
+
         if msg == WM_XBUTTONDOWN {
-            let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
             let button = ((info.mouseData >> 16) & 0xffff) as u16;
             let action = if let Ok(r) = MOUSE_BINDINGS.read() {
                 match button {
@@ -149,7 +173,10 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         toggle_topmost(hwnd);
                     }
                     MouseAction::ToggleClickThrough => {
-                        toggle_click_through(hwnd);
+                        toggle_mouse_passthrough(hwnd);
+                    }
+                    MouseAction::TogglePenPassthrough => {
+                        toggle_pen_passthrough(hwnd);
                     }
                     MouseAction::ResetCurrent => {
                         restore_window(hwnd);
@@ -163,6 +190,69 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         });
                     }
                     MouseAction::None => {}
+                }
+            }
+        } else if matches!(
+            msg,
+            WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
+        ) {
+            let pt = POINT {
+                x: info.pt.x,
+                y: info.pt.y,
+            };
+            let hit = WindowFromPoint(pt);
+            if !hit.0.is_null() {
+                let root = GetAncestor(hit, GA_ROOT);
+                let root_val = root.0 as isize;
+                if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
+                    let is_pen = (info.dwExtraInfo & 0xFFFFFF00) == 0xFF515700;
+                    let wants = if is_pen {
+                        state.pen_passthrough
+                    } else {
+                        state.mouse_passthrough
+                    };
+                    let all = state.mouse_passthrough && state.pen_passthrough;
+                    if wants && !all {
+                        let orig = GetWindowLongW(root, GWL_EXSTYLE) as u32;
+                        let _ =
+                            SetWindowLongW(root, GWL_EXSTYLE, (orig | WS_EX_TRANSPARENT.0) as i32);
+
+                        let cx = (GetSystemMetrics(SM_CXSCREEN) - 1).max(1);
+                        let cy = (GetSystemMetrics(SM_CYSCREEN) - 1).max(1);
+                        let flags = MOUSEEVENTF_ABSOLUTE
+                            | MOUSEEVENTF_MOVE
+                            | match msg {
+                                WM_LBUTTONDOWN => MOUSEEVENTF_LEFTDOWN,
+                                WM_LBUTTONUP => MOUSEEVENTF_LEFTUP,
+                                WM_RBUTTONDOWN => MOUSEEVENTF_RIGHTDOWN,
+                                WM_RBUTTONUP => MOUSEEVENTF_RIGHTUP,
+                                WM_MBUTTONDOWN => MOUSEEVENTF_MIDDLEDOWN,
+                                WM_MBUTTONUP => MOUSEEVENTF_MIDDLEUP,
+                                _ => MOUSE_EVENT_FLAGS(0),
+                            };
+                        let inp = INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dx: (pt.x * 65535) / cx,
+                                    dy: (pt.y * 65535) / cy,
+                                    mouseData: 0,
+                                    dwFlags: flags,
+                                    time: 0,
+                                    dwExtraInfo: TRANSG_GLASS_INJECT_EXTRA_INFO,
+                                },
+                            },
+                        };
+                        let _ = SendInput(&[inp], std::mem::size_of::<INPUT>() as i32);
+
+                        let _ = SetWindowLongW(root, GWL_EXSTYLE, orig as i32);
+                        return LRESULT(1);
+                    }
                 }
             }
         }
@@ -249,7 +339,8 @@ unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), Strin
                 current_alpha: 255,
                 original_is_topmost: is_top,
                 user_pref_topmost: is_top,
-                click_through: false,
+                mouse_passthrough: false,
+                pen_passthrough: false,
                 title,
             },
         );
@@ -259,7 +350,13 @@ unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), Strin
     let new_alpha = (state.current_alpha as i32 + delta).clamp(30, 255) as u8;
     state.current_alpha = new_alpha;
 
-    apply_transparency_to_hwnd(hwnd, new_alpha, state.user_pref_topmost, state.click_through)?;
+    apply_transparency_to_hwnd(
+        hwnd,
+        new_alpha,
+        state.user_pref_topmost,
+        state.mouse_passthrough,
+        state.pen_passthrough,
+    )?;
     request_ui_repaint();
     Ok(())
 }
@@ -268,11 +365,12 @@ unsafe fn apply_transparency_to_hwnd(
     hwnd: HWND,
     alpha: u8,
     topmost: bool,
-    click_through: bool,
+    mouse_passthrough: bool,
+    pen_passthrough: bool,
 ) -> Result<(), String> {
     let current_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     let mut next_style = current_style | WS_EX_LAYERED.0;
-    if click_through {
+    if mouse_passthrough && pen_passthrough {
         next_style |= WS_EX_TRANSPARENT.0;
     } else {
         next_style &= !WS_EX_TRANSPARENT.0;
@@ -312,13 +410,14 @@ unsafe fn toggle_topmost(hwnd: HWND) {
             hwnd,
             state.current_alpha,
             state.user_pref_topmost,
-            state.click_through,
+            state.mouse_passthrough,
+            state.pen_passthrough,
         );
     }
     request_ui_repaint();
 }
 
-unsafe fn toggle_click_through(hwnd: HWND) {
+unsafe fn toggle_mouse_passthrough(hwnd: HWND) {
     if hwnd.0.is_null() {
         return;
     }
@@ -337,18 +436,58 @@ unsafe fn toggle_click_through(hwnd: HWND) {
                 current_alpha: 255,
                 original_is_topmost: is_top,
                 user_pref_topmost: is_top,
-                click_through: false,
+                mouse_passthrough: false,
+                pen_passthrough: false,
                 title,
             },
         );
     }
     if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
-        state.click_through = !state.click_through;
+        state.mouse_passthrough = !state.mouse_passthrough;
         let _ = apply_transparency_to_hwnd(
             hwnd,
             state.current_alpha,
             state.user_pref_topmost,
-            state.click_through,
+            state.mouse_passthrough,
+            state.pen_passthrough,
+        );
+    }
+    request_ui_repaint();
+}
+
+unsafe fn toggle_pen_passthrough(hwnd: HWND) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    if is_own_hwnd(hwnd) {
+        return;
+    }
+    let hwnd_val = hwnd.0 as isize;
+    if GLOBAL_REGISTRY.get(&hwnd_val).is_none() {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_top = (ex_style & WS_EX_TOPMOST.0) != 0;
+        let title = get_window_title(hwnd);
+        GLOBAL_REGISTRY.insert(
+            hwnd_val,
+            WindowState {
+                original_ex_style: ex_style,
+                current_alpha: 255,
+                original_is_topmost: is_top,
+                user_pref_topmost: is_top,
+                mouse_passthrough: false,
+                pen_passthrough: false,
+                title,
+            },
+        );
+    }
+    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
+        state.pen_passthrough = !state.pen_passthrough;
+        let _ = apply_transparency_to_hwnd(
+            hwnd,
+            state.current_alpha,
+            state.user_pref_topmost,
+            state.mouse_passthrough,
+            state.pen_passthrough,
         );
     }
     request_ui_repaint();
@@ -508,7 +647,7 @@ impl eframe::App for TransGlassApp {
                         .collect();
 
                     let mut to_restore: Vec<isize> = Vec::new();
-                    let mut changes: Vec<(isize, Option<u8>, Option<bool>, Option<bool>)> = Vec::new();
+                    let mut changes: Vec<PendingChange> = Vec::new();
 
                     for (hwnd_val, state) in entries {
                         if unsafe { is_own_hwnd(HWND(hwnd_val as *mut _)) } {
@@ -535,17 +674,46 @@ impl eframe::App for TransGlassApp {
                                         .show_value(false)
                                         .trailing_fill(true);
                                     if ui.add(slider).changed() {
-                                        changes.push((hwnd_val, Some(alpha_f32 as u8), None, None));
+                                        changes.push(PendingChange {
+                                            hwnd_val,
+                                            alpha: Some(alpha_f32 as u8),
+                                            topmost: None,
+                                            mouse_passthrough: None,
+                                            pen_passthrough: None,
+                                        });
                                     }
                                     ui.add_space(10.0);
                                     let mut topmost = state.user_pref_topmost;
                                     if ui.checkbox(&mut topmost, "置顶").changed() {
-                                        changes.push((hwnd_val, None, Some(topmost), None));
+                                        changes.push(PendingChange {
+                                            hwnd_val,
+                                            alpha: None,
+                                            topmost: Some(topmost),
+                                            mouse_passthrough: None,
+                                            pen_passthrough: None,
+                                        });
                                     }
                                     ui.add_space(10.0);
-                                    let mut click_through = state.click_through;
-                                    if ui.checkbox(&mut click_through, "点透").changed() {
-                                        changes.push((hwnd_val, None, None, Some(click_through)));
+                                    let mut mouse_passthrough = state.mouse_passthrough;
+                                    if ui.checkbox(&mut mouse_passthrough, "鼠标点透").changed() {
+                                        changes.push(PendingChange {
+                                            hwnd_val,
+                                            alpha: None,
+                                            topmost: None,
+                                            mouse_passthrough: Some(mouse_passthrough),
+                                            pen_passthrough: None,
+                                        });
+                                    }
+                                    ui.add_space(10.0);
+                                    let mut pen_passthrough = state.pen_passthrough;
+                                    if ui.checkbox(&mut pen_passthrough, "笔点透").changed() {
+                                        changes.push(PendingChange {
+                                            hwnd_val,
+                                            alpha: None,
+                                            topmost: None,
+                                            mouse_passthrough: None,
+                                            pen_passthrough: Some(pen_passthrough),
+                                        });
                                     }
                                 });
                             });
@@ -556,27 +724,32 @@ impl eframe::App for TransGlassApp {
                         unsafe { restore_window(HWND(hwnd_val as *mut _)); }
                     }
 
-                    for (hwnd_val, alpha_opt, top_opt, click_opt) in changes {
+                    for c in changes {
                         let mut apply_alpha: Option<u8> = None;
                         let mut apply_top: Option<bool> = None;
-                        let mut apply_click: Option<bool> = None;
-                        if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
-                            if let Some(a) = alpha_opt {
+                        let mut apply_mouse: Option<bool> = None;
+                        let mut apply_pen: Option<bool> = None;
+                        if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&c.hwnd_val) {
+                            if let Some(a) = c.alpha {
                                 state.current_alpha = a;
                             }
-                            if let Some(t) = top_opt {
+                            if let Some(t) = c.topmost {
                                 state.user_pref_topmost = t;
                             }
-                            if let Some(c) = click_opt {
-                                state.click_through = c;
+                            if let Some(m) = c.mouse_passthrough {
+                                state.mouse_passthrough = m;
+                            }
+                            if let Some(p) = c.pen_passthrough {
+                                state.pen_passthrough = p;
                             }
                             apply_alpha = Some(state.current_alpha);
                             apply_top = Some(state.user_pref_topmost);
-                            apply_click = Some(state.click_through);
+                            apply_mouse = Some(state.mouse_passthrough);
+                            apply_pen = Some(state.pen_passthrough);
                         }
-                        if let (Some(a), Some(t), Some(c)) = (apply_alpha, apply_top, apply_click) {
+                        if let (Some(a), Some(t), Some(m), Some(p)) = (apply_alpha, apply_top, apply_mouse, apply_pen) {
                             unsafe {
-                                let _ = apply_transparency_to_hwnd(HWND(hwnd_val as *mut _), a, t, c);
+                                let _ = apply_transparency_to_hwnd(HWND(c.hwnd_val as *mut _), a, t, m, p);
                             }
                         }
                     }
@@ -602,7 +775,7 @@ impl eframe::App for TransGlassApp {
             ui.group(|ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("快捷键提示").strong().size(12.0));
-                    ui.label(egui::RichText::new("Alt + Z/X: 调节透明度 | Alt + T: 窗口置顶 | Alt + P: 点透\nAlt + R: 还原当前窗口 | Alt + Shift + R: 还原全部").small().weak());
+                    ui.label(egui::RichText::new("Alt + Z/X: 调节透明度 | Alt + T: 窗口置顶 | Alt + P: 鼠标点透 | Alt + Shift + P: 笔点透\nAlt + R: 还原当前窗口 | Alt + Shift + R: 还原全部").small().weak());
                 });
             });
         });
@@ -759,20 +932,23 @@ fn main() -> Result<(), eframe::Error> {
                         toggle_topmost(hwnd);
                     }
                     4 => {
-                        toggle_click_through(hwnd);
+                        toggle_mouse_passthrough(hwnd);
                     }
                     5 => {
-                        restore_window(hwnd);
+                        toggle_pen_passthrough(hwnd);
                     }
                     6 => {
-                        restore_all_windows();
+                        restore_window(hwnd);
                     }
                     7 => {
+                        restore_all_windows();
+                    }
+                    8 => {
                         thread::spawn(|| {
                             let _ = run_self_update();
                         });
                     }
-                    8 => {
+                    9 => {
                         let cfg = load_or_create_hotkey_config();
                         unregister_all_hotkeys();
                         set_mouse_bindings(&cfg);
@@ -834,6 +1010,7 @@ struct HotkeyConfig {
     decrease: HotkeySpec,
     toggle_top: HotkeySpec,
     toggle_click_through: Option<HotkeySpec>,
+    toggle_pen_passthrough: Option<HotkeySpec>,
     reset_current: HotkeySpec,
     reset_all: HotkeySpec,
     update: HotkeySpec,
@@ -857,6 +1034,10 @@ fn default_config() -> HotkeyConfig {
         },
         toggle_click_through: Some(HotkeySpec {
             modifiers: "ALT".into(),
+            key: "P".into(),
+        }),
+        toggle_pen_passthrough: Some(HotkeySpec {
+            modifiers: "ALT+SHIFT".into(),
             key: "P".into(),
         }),
         reset_current: HotkeySpec {
@@ -960,18 +1141,23 @@ unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
         key: "P".into(),
     });
     try_register_hotkey(4, &toggle_click, "ToggleClickThrough");
-    try_register_hotkey(5, &cfg.reset_current, "ResetCurrent");
-    try_register_hotkey(6, &cfg.reset_all, "ResetAll");
-    try_register_hotkey(7, &cfg.update, "Update");
+    let toggle_pen = cfg.toggle_pen_passthrough.clone().unwrap_or(HotkeySpec {
+        modifiers: "ALT+SHIFT".into(),
+        key: "P".into(),
+    });
+    try_register_hotkey(5, &toggle_pen, "TogglePenPassthrough");
+    try_register_hotkey(6, &cfg.reset_current, "ResetCurrent");
+    try_register_hotkey(7, &cfg.reset_all, "ResetAll");
+    try_register_hotkey(8, &cfg.update, "Update");
     let reload = cfg.reload.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT+SHIFT".into(),
         key: "C".into(),
     });
-    try_register_hotkey(8, &reload, "ReloadConfig");
+    try_register_hotkey(9, &reload, "ReloadConfig");
 }
 
 unsafe fn unregister_all_hotkeys() {
-    for id in 1..=8 {
+    for id in 1..=9 {
         let _ = UnregisterHotKey(None, id);
     }
 }
