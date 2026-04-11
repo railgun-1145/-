@@ -10,6 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::thread;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -27,22 +28,151 @@ struct WindowState {
     current_alpha: u8,
     original_is_topmost: bool,
     user_pref_topmost: bool,
+    click_through: bool,
     title: String,
 }
 
 lazy_static! {
     static ref GLOBAL_REGISTRY: DashMap<isize, WindowState> = DashMap::new();
+    static ref MOUSE_BINDINGS: RwLock<MouseBindings> = RwLock::new(MouseBindings::default());
 }
 
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
 static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
 static EXITING: AtomicBool = AtomicBool::new(false);
 static ROOT_HWND: AtomicIsize = AtomicIsize::new(0);
+static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseAction {
+    None,
+    Increase,
+    Decrease,
+    ToggleTopmost,
+    ToggleClickThrough,
+    ResetCurrent,
+    ResetAll,
+    Update,
+}
+
+#[derive(Clone, Copy)]
+struct MouseBindings {
+    xbutton1: MouseAction,
+    xbutton2: MouseAction,
+}
+
+impl Default for MouseBindings {
+    fn default() -> Self {
+        Self {
+            xbutton1: MouseAction::Decrease,
+            xbutton2: MouseAction::Increase,
+        }
+    }
+}
 
 fn request_ui_repaint() {
     if let Some(ctx) = EGUI_CTX.get() {
         ctx.request_repaint();
     }
+}
+
+fn parse_mouse_action(s: &str) -> MouseAction {
+    match s.trim().to_lowercase().as_str() {
+        "increase" | "inc" | "up" => MouseAction::Increase,
+        "decrease" | "dec" | "down" => MouseAction::Decrease,
+        "toggle_topmost" | "topmost" | "toggle_top" => MouseAction::ToggleTopmost,
+        "toggle_click_through" | "click_through" | "toggle_click" => MouseAction::ToggleClickThrough,
+        "reset_current" | "reset" => MouseAction::ResetCurrent,
+        "reset_all" => MouseAction::ResetAll,
+        "update" => MouseAction::Update,
+        _ => MouseAction::None,
+    }
+}
+
+fn set_mouse_bindings(cfg: &HotkeyConfig) {
+    let mut b = MouseBindings::default();
+    if let Some(spec) = cfg.mouse.as_ref() {
+        if let Some(s) = spec.xbutton1.as_ref() {
+            b.xbutton1 = parse_mouse_action(s);
+        }
+        if let Some(s) = spec.xbutton2.as_ref() {
+            b.xbutton2 = parse_mouse_action(s);
+        }
+    }
+    if let Ok(mut w) = MOUSE_BINDINGS.write() {
+        *w = b;
+    }
+}
+
+unsafe fn install_mouse_hook() {
+    if MOUSE_HOOK.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    let hook = SetWindowsHookExW(
+        WH_MOUSE_LL,
+        Some(mouse_hook_proc),
+        HINSTANCE(std::ptr::null_mut()),
+        0,
+    );
+    if let Ok(hook) = hook {
+        if !hook.0.is_null() {
+            MOUSE_HOOK.store(hook.0 as isize, Ordering::SeqCst);
+        }
+    }
+}
+
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let msg = wparam.0 as u32;
+        if msg == WM_XBUTTONDOWN {
+            let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
+            let button = ((info.mouseData >> 16) & 0xffff) as u16;
+            let action = if let Ok(r) = MOUSE_BINDINGS.read() {
+                match button {
+                    1 => r.xbutton1,
+                    2 => r.xbutton2,
+                    _ => MouseAction::None,
+                }
+            } else {
+                MouseAction::None
+            };
+            if action != MouseAction::None {
+                let hwnd = GetForegroundWindow();
+                match action {
+                    MouseAction::Increase => {
+                        let _ = adjust_window_transparency(hwnd, 25);
+                    }
+                    MouseAction::Decrease => {
+                        let _ = adjust_window_transparency(hwnd, -25);
+                    }
+                    MouseAction::ToggleTopmost => {
+                        toggle_topmost(hwnd);
+                    }
+                    MouseAction::ToggleClickThrough => {
+                        toggle_click_through(hwnd);
+                    }
+                    MouseAction::ResetCurrent => {
+                        restore_window(hwnd);
+                    }
+                    MouseAction::ResetAll => {
+                        restore_all_windows();
+                    }
+                    MouseAction::Update => {
+                        thread::spawn(|| {
+                            let _ = run_self_update();
+                        });
+                    }
+                    MouseAction::None => {}
+                }
+            }
+        }
+    }
+    CallNextHookEx(
+        HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+        code,
+        wparam,
+        lparam,
+    )
 }
 
 fn show_root_window() {
@@ -119,6 +249,7 @@ unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), Strin
                 current_alpha: 255,
                 original_is_topmost: is_top,
                 user_pref_topmost: is_top,
+                click_through: false,
                 title,
             },
         );
@@ -128,15 +259,26 @@ unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), Strin
     let new_alpha = (state.current_alpha as i32 + delta).clamp(30, 255) as u8;
     state.current_alpha = new_alpha;
 
-    apply_transparency_to_hwnd(hwnd, new_alpha, state.user_pref_topmost)?;
+    apply_transparency_to_hwnd(hwnd, new_alpha, state.user_pref_topmost, state.click_through)?;
     request_ui_repaint();
     Ok(())
 }
 
-unsafe fn apply_transparency_to_hwnd(hwnd: HWND, alpha: u8, topmost: bool) -> Result<(), String> {
+unsafe fn apply_transparency_to_hwnd(
+    hwnd: HWND,
+    alpha: u8,
+    topmost: bool,
+    click_through: bool,
+) -> Result<(), String> {
     let current_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    if (current_style & WS_EX_LAYERED.0) == 0 {
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, (current_style | WS_EX_LAYERED.0) as i32);
+    let mut next_style = current_style | WS_EX_LAYERED.0;
+    if click_through {
+        next_style |= WS_EX_TRANSPARENT.0;
+    } else {
+        next_style &= !WS_EX_TRANSPARENT.0;
+    }
+    if next_style != current_style {
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, next_style as i32);
     }
     SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).map_err(|e| e.to_string())?;
 
@@ -152,7 +294,7 @@ unsafe fn apply_transparency_to_hwnd(hwnd: HWND, alpha: u8, topmost: bool) -> Re
         0,
         0,
         0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_FRAMECHANGED,
     );
     Ok(())
 }
@@ -166,7 +308,48 @@ unsafe fn toggle_topmost(hwnd: HWND) {
     }
     if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&(hwnd.0 as isize)) {
         state.user_pref_topmost = !state.user_pref_topmost;
-        let _ = apply_transparency_to_hwnd(hwnd, state.current_alpha, state.user_pref_topmost);
+        let _ = apply_transparency_to_hwnd(
+            hwnd,
+            state.current_alpha,
+            state.user_pref_topmost,
+            state.click_through,
+        );
+    }
+    request_ui_repaint();
+}
+
+unsafe fn toggle_click_through(hwnd: HWND) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    if is_own_hwnd(hwnd) {
+        return;
+    }
+    let hwnd_val = hwnd.0 as isize;
+    if GLOBAL_REGISTRY.get(&hwnd_val).is_none() {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_top = (ex_style & WS_EX_TOPMOST.0) != 0;
+        let title = get_window_title(hwnd);
+        GLOBAL_REGISTRY.insert(
+            hwnd_val,
+            WindowState {
+                original_ex_style: ex_style,
+                current_alpha: 255,
+                original_is_topmost: is_top,
+                user_pref_topmost: is_top,
+                click_through: false,
+                title,
+            },
+        );
+    }
+    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
+        state.click_through = !state.click_through;
+        let _ = apply_transparency_to_hwnd(
+            hwnd,
+            state.current_alpha,
+            state.user_pref_topmost,
+            state.click_through,
+        );
     }
     request_ui_repaint();
 }
@@ -325,7 +508,7 @@ impl eframe::App for TransGlassApp {
                         .collect();
 
                     let mut to_restore: Vec<isize> = Vec::new();
-                    let mut changes: Vec<(isize, Option<u8>, Option<bool>)> = Vec::new();
+                    let mut changes: Vec<(isize, Option<u8>, Option<bool>, Option<bool>)> = Vec::new();
 
                     for (hwnd_val, state) in entries {
                         if unsafe { is_own_hwnd(HWND(hwnd_val as *mut _)) } {
@@ -352,12 +535,17 @@ impl eframe::App for TransGlassApp {
                                         .show_value(false)
                                         .trailing_fill(true);
                                     if ui.add(slider).changed() {
-                                        changes.push((hwnd_val, Some(alpha_f32 as u8), None));
+                                        changes.push((hwnd_val, Some(alpha_f32 as u8), None, None));
                                     }
                                     ui.add_space(10.0);
                                     let mut topmost = state.user_pref_topmost;
                                     if ui.checkbox(&mut topmost, "置顶").changed() {
-                                        changes.push((hwnd_val, None, Some(topmost)));
+                                        changes.push((hwnd_val, None, Some(topmost), None));
+                                    }
+                                    ui.add_space(10.0);
+                                    let mut click_through = state.click_through;
+                                    if ui.checkbox(&mut click_through, "点透").changed() {
+                                        changes.push((hwnd_val, None, None, Some(click_through)));
                                     }
                                 });
                             });
@@ -368,9 +556,10 @@ impl eframe::App for TransGlassApp {
                         unsafe { restore_window(HWND(hwnd_val as *mut _)); }
                     }
 
-                    for (hwnd_val, alpha_opt, top_opt) in changes {
+                    for (hwnd_val, alpha_opt, top_opt, click_opt) in changes {
                         let mut apply_alpha: Option<u8> = None;
                         let mut apply_top: Option<bool> = None;
+                        let mut apply_click: Option<bool> = None;
                         if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
                             if let Some(a) = alpha_opt {
                                 state.current_alpha = a;
@@ -378,11 +567,17 @@ impl eframe::App for TransGlassApp {
                             if let Some(t) = top_opt {
                                 state.user_pref_topmost = t;
                             }
+                            if let Some(c) = click_opt {
+                                state.click_through = c;
+                            }
                             apply_alpha = Some(state.current_alpha);
                             apply_top = Some(state.user_pref_topmost);
+                            apply_click = Some(state.click_through);
                         }
-                        if let (Some(a), Some(t)) = (apply_alpha, apply_top) {
-                            unsafe { let _ = apply_transparency_to_hwnd(HWND(hwnd_val as *mut _), a, t); }
+                        if let (Some(a), Some(t), Some(c)) = (apply_alpha, apply_top, apply_click) {
+                            unsafe {
+                                let _ = apply_transparency_to_hwnd(HWND(hwnd_val as *mut _), a, t, c);
+                            }
                         }
                     }
                 });
@@ -407,7 +602,7 @@ impl eframe::App for TransGlassApp {
             ui.group(|ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("快捷键提示").strong().size(12.0));
-                    ui.label(egui::RichText::new("Alt + Z/X: 调节透明度 | Alt + T: 窗口置顶\nAlt + R: 还原当前窗口 | Alt + Shift + R: 还原全部").small().weak());
+                    ui.label(egui::RichText::new("Alt + Z/X: 调节透明度 | Alt + T: 窗口置顶 | Alt + P: 点透\nAlt + R: 还原当前窗口 | Alt + Shift + R: 还原全部").small().weak());
                 });
             });
         });
@@ -545,7 +740,9 @@ fn main() -> Result<(), eframe::Error> {
 
     thread::spawn(|| unsafe {
         let cfg = load_or_create_hotkey_config();
+        set_mouse_bindings(&cfg);
         bind_hotkeys(&cfg);
+        install_mouse_hook();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -562,19 +759,23 @@ fn main() -> Result<(), eframe::Error> {
                         toggle_topmost(hwnd);
                     }
                     4 => {
-                        restore_window(hwnd);
+                        toggle_click_through(hwnd);
                     }
                     5 => {
-                        restore_all_windows();
+                        restore_window(hwnd);
                     }
                     6 => {
+                        restore_all_windows();
+                    }
+                    7 => {
                         thread::spawn(|| {
                             let _ = run_self_update();
                         });
                     }
-                    7 => {
+                    8 => {
                         let cfg = load_or_create_hotkey_config();
                         unregister_all_hotkeys();
+                        set_mouse_bindings(&cfg);
                         bind_hotkeys(&cfg);
                     }
                     _ => {}
@@ -622,14 +823,22 @@ struct HotkeySpec {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
+struct MouseBindingsSpec {
+    xbutton1: Option<String>,
+    xbutton2: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 struct HotkeyConfig {
     increase: HotkeySpec,
     decrease: HotkeySpec,
     toggle_top: HotkeySpec,
+    toggle_click_through: Option<HotkeySpec>,
     reset_current: HotkeySpec,
     reset_all: HotkeySpec,
     update: HotkeySpec,
     reload: Option<HotkeySpec>,
+    mouse: Option<MouseBindingsSpec>,
 }
 
 fn default_config() -> HotkeyConfig {
@@ -646,6 +855,10 @@ fn default_config() -> HotkeyConfig {
             modifiers: "ALT".into(),
             key: "T".into(),
         },
+        toggle_click_through: Some(HotkeySpec {
+            modifiers: "ALT".into(),
+            key: "P".into(),
+        }),
         reset_current: HotkeySpec {
             modifiers: "ALT".into(),
             key: "R".into(),
@@ -661,6 +874,10 @@ fn default_config() -> HotkeyConfig {
         reload: Some(HotkeySpec {
             modifiers: "ALT+SHIFT".into(),
             key: "C".into(),
+        }),
+        mouse: Some(MouseBindingsSpec {
+            xbutton1: Some("decrease".into()),
+            xbutton2: Some("increase".into()),
         }),
     }
 }
@@ -738,18 +955,23 @@ unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
     try_register_hotkey(1, &cfg.increase, "Increase");
     try_register_hotkey(2, &cfg.decrease, "Decrease");
     try_register_hotkey(3, &cfg.toggle_top, "ToggleTopmost");
-    try_register_hotkey(4, &cfg.reset_current, "ResetCurrent");
-    try_register_hotkey(5, &cfg.reset_all, "ResetAll");
-    try_register_hotkey(6, &cfg.update, "Update");
+    let toggle_click = cfg.toggle_click_through.clone().unwrap_or(HotkeySpec {
+        modifiers: "ALT".into(),
+        key: "P".into(),
+    });
+    try_register_hotkey(4, &toggle_click, "ToggleClickThrough");
+    try_register_hotkey(5, &cfg.reset_current, "ResetCurrent");
+    try_register_hotkey(6, &cfg.reset_all, "ResetAll");
+    try_register_hotkey(7, &cfg.update, "Update");
     let reload = cfg.reload.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT+SHIFT".into(),
         key: "C".into(),
     });
-    try_register_hotkey(7, &reload, "ReloadConfig");
+    try_register_hotkey(8, &reload, "ReloadConfig");
 }
 
 unsafe fn unregister_all_hotkeys() {
-    for id in 1..=7 {
+    for id in 1..=8 {
         let _ = UnregisterHotKey(None, id);
     }
 }
