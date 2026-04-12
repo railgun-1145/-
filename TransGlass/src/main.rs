@@ -22,8 +22,18 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+// 日志系统
+use log::{debug, info, warn, error};
+use env_logger;
+
+// 线程池
+use rayon;
+
+// UI 重绘节流常量
+const REPAINT_THROTTLE: Duration = Duration::from_millis(50); // ~20 FPS，减少重绘频率
+
 // --- 核心状态注册表 ---
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct WindowState {
     original_ex_style: u32,
     current_alpha: u8,
@@ -34,11 +44,15 @@ struct WindowState {
     title: String,
 }
 
+// 优化：使用更轻量的同步原语
 lazy_static! {
     static ref GLOBAL_REGISTRY: DashMap<isize, WindowState> = DashMap::new();
     static ref MOUSE_BINDINGS: RwLock<MouseBindings> = RwLock::new(MouseBindings::default());
     static ref PASSTHROUGH_DRAG: Mutex<Option<PassthroughDragState>> = Mutex::new(None);
 }
+
+// 快速检查是否有拖拽状态进行中（原子变量，避免锁操作）
+static HAS_ACTIVE_DRAG: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct PendingChange {
@@ -98,9 +112,22 @@ impl Default for MouseBindings {
     }
 }
 
+use std::time::{Instant, Duration};
+use std::sync::LazyLock;
+
+// 用于 UI 更新节流的时间戳
+static LAST_REPAINT: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
+
 fn request_ui_repaint() {
     if let Some(ctx) = EGUI_CTX.get() {
-        ctx.request_repaint();
+        // 实现简单的节流，避免过于频繁的重绘
+        if let Ok(mut last) = LAST_REPAINT.try_lock() {
+            let now = Instant::now();
+            if now - *last >= REPAINT_THROTTLE {
+                ctx.request_repaint();
+                *last = now;
+            }
+        }
     }
 }
 
@@ -280,6 +307,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     let msg = wparam.0 as u32;
     let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
 
+    // 快速跳过本程序注入的事件
     if info.dwExtraInfo == TRANSG_GLASS_INJECT_EXTRA_INFO {
         return CallNextHookEx(
             HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
@@ -294,19 +322,66 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         y: info.pt.y,
     };
 
-    // 结束由本程序接管的拖拽：注入 UP 并清理状态
+    // 快速检查是否是TransGlass自身窗口
+    let hit = WindowFromPoint(pt);
+    if !hit.0.is_null() {
+        let root = GetAncestor(hit, GA_ROOT);
+        if is_own_hwnd(root) {
+            // 允许拖动TransGlass窗口（非置顶时）
+            if msg == WM_LBUTTONDOWN {
+                // 检查是否非置顶
+                let current_style = GetWindowLongW(root, GWL_EXSTYLE) as u32;
+                let is_topmost = (current_style & WS_EX_TOPMOST.0) != 0;
+                if !is_topmost {
+                    // 启动窗口拖动
+                    let _ = ReleaseCapture();
+                    SendMessageW(root, WM_SYSCOMMAND, WPARAM((SC_MOVE | HTCAPTION) as usize), LPARAM(0));
+                    return LRESULT(1);
+                }
+            }
+            // 对于TransGlass自身窗口，直接传递事件
+            return CallNextHookEx(
+                HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                code,
+                wparam,
+                lparam,
+            );
+        }
+    }
+
+    // 1. 处理拖拽结束 - 只在按键抬起时处理
     if is_button_up_msg(msg) {
-        if let Some(mask) = button_drag_mask(msg) {
-            if let Ok(mut guard) = PASSTHROUGH_DRAG.lock() {
-                if let Some(ref mut st) = *guard {
-                    if st.buttons & mask != 0 {
-                        let root = HWND(st.root_val as *mut _);
-                        let _g = ExStyleGuard::add_transparent(root);
-                        let _ = inject_mouse_button_at_pt(pt, msg);
-                        st.buttons &= !mask;
-                        if st.buttons == 0 {
-                            *guard = None;
+        // 快速检查是否有拖拽状态，避免不必要的锁
+        if HAS_ACTIVE_DRAG.load(Ordering::Relaxed) {
+            if let Some(mask) = button_drag_mask(msg) {
+                if let Ok(mut guard) = PASSTHROUGH_DRAG.try_lock() {
+                    if let Some(ref mut st) = *guard {
+                        if st.buttons & mask != 0 {
+                            let root = HWND(st.root_val as *mut _);
+                            let _g = ExStyleGuard::add_transparent(root);
+                            let _ = inject_mouse_button_at_pt(pt, msg);
+                            st.buttons &= !mask;
+                            if st.buttons == 0 {
+                                *guard = None;
+                                HAS_ACTIVE_DRAG.store(false, Ordering::Relaxed);
+                            }
+                            return LRESULT(1);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 处理拖拽中的移动 - 高频事件，需要优化
+    if msg == WM_MOUSEMOVE {
+        // 快速检查是否有拖拽状态
+        if HAS_ACTIVE_DRAG.load(Ordering::Relaxed) {
+            // 使用 try_lock 避免阻塞
+            if let Ok(guard) = PASSTHROUGH_DRAG.try_lock() {
+                if let Some(ref st) = *guard {
+                    if st.buttons != 0 {
+                        let _ = inject_mouse_move_at_pt(pt);
                         return LRESULT(1);
                     }
                 }
@@ -314,21 +389,11 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         }
     }
 
-    // 拖拽中的移动：持续注入到下层，直到对应按键释放
-    if msg == WM_MOUSEMOVE {
-        if let Ok(guard) = PASSTHROUGH_DRAG.lock() {
-            if let Some(ref st) = *guard {
-                if st.buttons != 0 {
-                    let _ = inject_mouse_move_at_pt(pt);
-                    return LRESULT(1);
-                }
-            }
-        }
-    }
-
+    // 3. 处理侧键点击 - 低频事件
     if msg == WM_XBUTTONDOWN {
         let button = ((info.mouseData >> 16) & 0xffff) as u16;
-        let action = if let Ok(r) = MOUSE_BINDINGS.read() {
+        // 快速获取鼠标绑定，避免不必要的锁
+        let action = if let Ok(r) = MOUSE_BINDINGS.try_read() {
             match button {
                 1 => r.xbutton1,
                 2 => r.xbutton2,
@@ -338,50 +403,56 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             MouseAction::None
         };
         if action != MouseAction::None {
-            let hwnd = GetForegroundWindow();
-            match action {
-                MouseAction::Increase => {
-                    let _ = adjust_window_transparency(hwnd, 25);
+            // 使用线程池处理耗时操作，避免阻塞钩子
+            rayon::spawn(move || {
+                // 在子线程中重新获取窗口句柄，避免跨线程传递HWND的风险
+                let hwnd = GetForegroundWindow();
+                if hwnd.0.is_null() {
+                    return;
                 }
-                MouseAction::Decrease => {
-                    let _ = adjust_window_transparency(hwnd, -25);
-                }
-                MouseAction::ToggleTopmost => {
-                    toggle_topmost(hwnd);
-                }
-                MouseAction::ToggleClickThrough => {
-                    toggle_mouse_passthrough(hwnd);
-                }
-                MouseAction::TogglePenPassthrough => {
-                    toggle_pen_passthrough(hwnd);
-                }
-                MouseAction::ResetCurrent => {
-                    restore_window(hwnd);
-                }
-                MouseAction::ResetAll => {
-                    restore_all_windows();
-                }
-                MouseAction::Update => {
-                    thread::spawn(|| {
+                match action {
+                    MouseAction::Increase => {
+                        let _ = adjust_window_transparency(hwnd, 25);
+                    }
+                    MouseAction::Decrease => {
+                        let _ = adjust_window_transparency(hwnd, -25);
+                    }
+                    MouseAction::ToggleTopmost => {
+                        toggle_topmost(hwnd);
+                    }
+                    MouseAction::ToggleClickThrough => {
+                        toggle_mouse_passthrough(hwnd);
+                    }
+                    MouseAction::TogglePenPassthrough => {
+                        toggle_pen_passthrough(hwnd);
+                    }
+                    MouseAction::ResetCurrent => {
+                        restore_window(hwnd);
+                    }
+                    MouseAction::ResetAll => {
+                        restore_all_windows();
+                    }
+                    MouseAction::Update => {
                         let _ = run_self_update();
-                    });
+                    }
+                    MouseAction::None => {}
                 }
-                MouseAction::None => {}
-            }
+            });
             return LRESULT(1);
         }
     }
 
+    // 4. 处理鼠标滚轮 - 中频事件
     if msg == WM_MOUSEWHEEL {
         let hit = WindowFromPoint(pt);
         if !hit.0.is_null() {
             let root = GetAncestor(hit, GA_ROOT);
             let root_val = root.0 as isize;
+            // 快速查找窗口状态
             if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
                 let all = state.mouse_passthrough && state.pen_passthrough;
                 if state.mouse_passthrough && !all {
-                    let delta =
-                        (((info.mouseData >> 16) & 0xFFFF) as u16 as i16) as i32;
+                    let delta = (((info.mouseData >> 16) & 0xFFFF) as u16 as i16) as i32;
                     let _g = ExStyleGuard::add_transparent(root);
                     let _ = inject_mouse_wheel_delta(delta);
                     return LRESULT(1);
@@ -390,6 +461,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         }
     }
 
+    // 5. 处理鼠标按键事件 - 中频事件
     if matches!(
         msg,
         WM_LBUTTONDOWN
@@ -403,6 +475,8 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         if !hit.0.is_null() {
             let root = GetAncestor(hit, GA_ROOT);
             let root_val = root.0 as isize;
+            
+            // 快速查找窗口状态
             if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
                 let is_pen = (info.dwExtraInfo & 0xFFFFFF00) == 0xFF515700;
                 let wants = if is_pen {
@@ -412,10 +486,13 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 };
                 let all = state.mouse_passthrough && state.pen_passthrough;
                 if wants && !all && is_button_down_msg(msg) {
+                    debug!("Processing {} event for window {:?}, is_pen: {}", 
+                        if is_pen { "pen" } else { "mouse" }, root_val, is_pen);
                     let _g = ExStyleGuard::add_transparent(root);
                     if inject_mouse_button_at_pt(pt, msg) {
                         if let Some(mask) = button_drag_mask(msg) {
-                            if let Ok(mut g) = PASSTHROUGH_DRAG.lock() {
+                            // 使用 try_lock 避免阻塞
+                            if let Ok(mut g) = PASSTHROUGH_DRAG.try_lock() {
                                 match *g {
                                     Some(ref mut st) if st.root_val == root_val => {
                                         st.buttons |= mask;
@@ -425,11 +502,17 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                                             root_val,
                                             buttons: mask,
                                         });
+                                        HAS_ACTIVE_DRAG.store(true, Ordering::Relaxed);
+                                        debug!("Started drag state for window: {}", root_val);
                                     }
                                 }
+                            } else {
+                                warn!("Failed to acquire drag lock");
                             }
                         }
                         return LRESULT(1);
+                    } else {
+                        warn!("Failed to inject mouse button event");
                     }
                 }
             }
@@ -699,6 +782,7 @@ unsafe fn restore_window(hwnd: HWND) {
         if let Some(st) = *g {
             if st.root_val == v {
                 *g = None;
+                HAS_ACTIVE_DRAG.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -723,6 +807,7 @@ unsafe fn restore_window(hwnd: HWND) {
 unsafe fn restore_all_windows() {
     if let Ok(mut g) = PASSTHROUGH_DRAG.lock() {
         *g = None;
+        HAS_ACTIVE_DRAG.store(false, Ordering::Relaxed);
     }
     let hwnds: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
     for hwnd_val in hwnds {
@@ -814,6 +899,19 @@ impl eframe::App for TransGlassApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             hide_root_window();
         }
+        
+        // 3. 处理真正的退出
+        if self.should_exit {
+            unsafe {
+                restore_all_windows();
+                let h = MOUSE_HOOK.swap(0, Ordering::SeqCst);
+                if h != 0 {
+                    let _ = UnhookWindowsHookEx(HHOOK(h as *mut _));
+                }
+                unregister_all_hotkeys();
+                ExitProcess(0);
+            }
+        }
 
         if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
             WINDOW_VISIBLE.store(false, Ordering::Relaxed);
@@ -857,117 +955,121 @@ impl eframe::App for TransGlassApp {
                             ui.add_space(60.0);
                             ui.label(egui::RichText::new("暂无管理记录\n使用热键开始管理").weak());
                         });
-                    }
+                    } else {
+                        // 优化：只遍历一次注册表，减少克隆操作
+                        let mut to_restore: Vec<isize> = Vec::new();
+                        let mut changes: Vec<PendingChange> = Vec::new();
 
-                    let entries: Vec<(isize, WindowState)> = GLOBAL_REGISTRY
-                        .iter()
-                        .map(|kv| (*kv.key(), kv.value().clone()))
-                        .collect();
+                        // 预先分配空间，减少内存分配
+                        to_restore.reserve(GLOBAL_REGISTRY.len());
+                        changes.reserve(GLOBAL_REGISTRY.len());
 
-                    let mut to_restore: Vec<isize> = Vec::new();
-                    let mut changes: Vec<PendingChange> = Vec::new();
+                        for entry in GLOBAL_REGISTRY.iter() {
+                            let hwnd_val = *entry.key();
+                            let state = entry.value();
 
-                    for (hwnd_val, state) in entries {
-                        if unsafe { is_own_hwnd(HWND(hwnd_val as *mut _)) } {
-                            continue;
-                        }
+                            // 跳过自己的窗口
+                            if unsafe { is_own_hwnd(HWND(hwnd_val as *mut _)) } {
+                                continue;
+                            }
 
-                        ui.add_space(4.0);
-                        ui.group(|ui| {
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::Label::new(egui::RichText::new(&state.title).strong().size(14.0)).truncate());
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("还原").clicked() {
-                                            to_restore.push(hwnd_val);
+                            ui.add_space(4.0);
+                            ui.group(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::Label::new(egui::RichText::new(&state.title).strong().size(14.0)).truncate());
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.button("还原").clicked() {
+                                                to_restore.push(hwnd_val);
+                                            }
+                                        });
+                                    });
+
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("透明度:");
+                                        let mut alpha_f32 = state.current_alpha as f32;
+                                        let slider = egui::Slider::new(&mut alpha_f32, 30.0..=255.0)
+                                            .show_value(false)
+                                            .trailing_fill(true);
+                                        if ui.add(slider).changed() {
+                                            changes.push(PendingChange {
+                                                hwnd_val,
+                                                alpha: Some(alpha_f32 as u8),
+                                                topmost: None,
+                                                mouse_passthrough: None,
+                                                pen_passthrough: None,
+                                            });
+                                        }
+                                        ui.add_space(10.0);
+                                        let mut topmost = state.user_pref_topmost;
+                                        if ui.checkbox(&mut topmost, "置顶").changed() {
+                                            changes.push(PendingChange {
+                                                hwnd_val,
+                                                alpha: None,
+                                                topmost: Some(topmost),
+                                                mouse_passthrough: None,
+                                                pen_passthrough: None,
+                                            });
+                                        }
+                                        ui.add_space(10.0);
+                                        let mut mouse_passthrough = state.mouse_passthrough;
+                                        if ui.checkbox(&mut mouse_passthrough, "鼠标点透").changed() {
+                                            changes.push(PendingChange {
+                                                hwnd_val,
+                                                alpha: None,
+                                                topmost: None,
+                                                mouse_passthrough: Some(mouse_passthrough),
+                                                pen_passthrough: None,
+                                            });
+                                        }
+                                        ui.add_space(10.0);
+                                        let mut pen_passthrough = state.pen_passthrough;
+                                        if ui.checkbox(&mut pen_passthrough, "笔点透").changed() {
+                                            changes.push(PendingChange {
+                                                hwnd_val,
+                                                alpha: None,
+                                                topmost: None,
+                                                mouse_passthrough: None,
+                                                pen_passthrough: Some(pen_passthrough),
+                                            });
                                         }
                                     });
                                 });
-
-                                ui.add_space(6.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("透明度:");
-                                    let mut alpha_f32 = state.current_alpha as f32;
-                                    let slider = egui::Slider::new(&mut alpha_f32, 30.0..=255.0)
-                                        .show_value(false)
-                                        .trailing_fill(true);
-                                    if ui.add(slider).changed() {
-                                        changes.push(PendingChange {
-                                            hwnd_val,
-                                            alpha: Some(alpha_f32 as u8),
-                                            topmost: None,
-                                            mouse_passthrough: None,
-                                            pen_passthrough: None,
-                                        });
-                                    }
-                                    ui.add_space(10.0);
-                                    let mut topmost = state.user_pref_topmost;
-                                    if ui.checkbox(&mut topmost, "置顶").changed() {
-                                        changes.push(PendingChange {
-                                            hwnd_val,
-                                            alpha: None,
-                                            topmost: Some(topmost),
-                                            mouse_passthrough: None,
-                                            pen_passthrough: None,
-                                        });
-                                    }
-                                    ui.add_space(10.0);
-                                    let mut mouse_passthrough = state.mouse_passthrough;
-                                    if ui.checkbox(&mut mouse_passthrough, "鼠标点透").changed() {
-                                        changes.push(PendingChange {
-                                            hwnd_val,
-                                            alpha: None,
-                                            topmost: None,
-                                            mouse_passthrough: Some(mouse_passthrough),
-                                            pen_passthrough: None,
-                                        });
-                                    }
-                                    ui.add_space(10.0);
-                                    let mut pen_passthrough = state.pen_passthrough;
-                                    if ui.checkbox(&mut pen_passthrough, "笔点透").changed() {
-                                        changes.push(PendingChange {
-                                            hwnd_val,
-                                            alpha: None,
-                                            topmost: None,
-                                            mouse_passthrough: None,
-                                            pen_passthrough: Some(pen_passthrough),
-                                        });
-                                    }
-                                });
                             });
-                        });
-                    }
-
-                    for hwnd_val in to_restore {
-                        unsafe { restore_window(HWND(hwnd_val as *mut _)); }
-                    }
-
-                    for c in changes {
-                        let mut apply_alpha: Option<u8> = None;
-                        let mut apply_top: Option<bool> = None;
-                        let mut apply_mouse: Option<bool> = None;
-                        let mut apply_pen: Option<bool> = None;
-                        if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&c.hwnd_val) {
-                            if let Some(a) = c.alpha {
-                                state.current_alpha = a;
-                            }
-                            if let Some(t) = c.topmost {
-                                state.user_pref_topmost = t;
-                            }
-                            if let Some(m) = c.mouse_passthrough {
-                                state.mouse_passthrough = m;
-                            }
-                            if let Some(p) = c.pen_passthrough {
-                                state.pen_passthrough = p;
-                            }
-                            apply_alpha = Some(state.current_alpha);
-                            apply_top = Some(state.user_pref_topmost);
-                            apply_mouse = Some(state.mouse_passthrough);
-                            apply_pen = Some(state.pen_passthrough);
                         }
-                        if let (Some(a), Some(t), Some(m), Some(p)) = (apply_alpha, apply_top, apply_mouse, apply_pen) {
-                            unsafe {
-                                let _ = apply_transparency_to_hwnd(HWND(c.hwnd_val as *mut _), a, t, m, p);
+
+                        // 批量处理还原操作
+                        for hwnd_val in to_restore {
+                            unsafe { restore_window(HWND(hwnd_val as *mut _)); }
+                        }
+
+                        // 批量处理变更操作
+                        for c in changes {
+                            if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&c.hwnd_val) {
+                                // 应用变更
+                                if let Some(a) = c.alpha {
+                                    state.current_alpha = a;
+                                }
+                                if let Some(t) = c.topmost {
+                                    state.user_pref_topmost = t;
+                                }
+                                if let Some(m) = c.mouse_passthrough {
+                                    state.mouse_passthrough = m;
+                                }
+                                if let Some(p) = c.pen_passthrough {
+                                    state.pen_passthrough = p;
+                                }
+                                // 一次性应用所有变更
+                                unsafe {
+                                    let _ = apply_transparency_to_hwnd(
+                                        HWND(c.hwnd_val as *mut _),
+                                        state.current_alpha,
+                                        state.user_pref_topmost,
+                                        state.mouse_passthrough,
+                                        state.pen_passthrough
+                                    );
+                                }
                             }
                         }
                     }
@@ -1055,29 +1157,19 @@ fn load_custom_icon() -> Option<tray_icon::Icon> {
         "icon2.png",
         "icon.png",
         "tray_icon.png",
-        "TransGlass_Distribution/icon2.png",
-        "TransGlass_Distribution/icon.png",
     ];
 
-    let mut bases: Vec<PathBuf> = Vec::new();
+    // 只检查可执行文件所在目录，减少文件系统操作
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            bases.push(dir.to_path_buf());
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        bases.push(cwd);
-    }
-    bases.push(PathBuf::from("."));
-
-    for base in bases {
-        for rel in paths {
-            let candidate = base.join(rel);
-            if let Ok(img) = image::open(&candidate) {
-                let rgba = img.to_rgba8();
-                let (width, height) = rgba.dimensions();
-                if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.into_raw(), width, height) {
-                    return Some(icon);
+            for rel in paths {
+                let candidate = dir.join(rel);
+                if let Ok(img) = image::open(&candidate) {
+                    let rgba = img.to_rgba8();
+                    let (width, height) = rgba.dimensions();
+                    if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.into_raw(), width, height) {
+                        return Some(icon);
+                    }
                 }
             }
         }
@@ -1086,10 +1178,20 @@ fn load_custom_icon() -> Option<tray_icon::Icon> {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // 初始化日志系统
+    env_logger::init();
+    info!("TransGlass v0.2.0 starting...");
+    
     unsafe {
         let _ = windows::Win32::System::Console::FreeConsole();
     }
 
+    // 1. 首先创建托盘图标，这样用户可以立即看到程序正在运行
+    info!("Creating tray icon...");
+    let _tray_icon = create_tray_icon();
+    info!("Tray icon created successfully");
+
+    // 2. 启动菜单事件处理线程
     thread::spawn(|| {
         while let Ok(event) = MenuEvent::receiver().recv() {
             match event.id.0.as_str() {
@@ -1117,6 +1219,7 @@ fn main() -> Result<(), eframe::Error> {
         }
     });
 
+    // 3. 启动托盘点击事件处理线程
     thread::spawn(|| {
         while let Ok(event) = TrayIconEvent::receiver().recv() {
             if matches!(
@@ -1134,25 +1237,40 @@ fn main() -> Result<(), eframe::Error> {
         }
     });
 
-    let _tray_icon = create_tray_icon();
-
+    // 4. 启动热键和鼠标钩子线程（优先级较低，避免阻塞启动）
     thread::spawn(|| unsafe {
         HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+        info!("Hotkey and mouse hook thread started");
 
+        // 延迟加载配置，避免阻塞启动
+        thread::sleep(std::time::Duration::from_millis(100));
+        
+        info!("Loading hotkey configuration...");
         let cfg = load_or_create_hotkey_config();
         set_mouse_bindings(&cfg);
         bind_hotkeys(&cfg);
+        info!("Installing mouse hook...");
         install_mouse_hook();
+        if MOUSE_HOOK.load(Ordering::SeqCst) != 0 {
+            info!("Mouse hook installed successfully");
+        } else {
+            error!("Failed to install mouse hook");
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_TRANSGLASS_SHUTDOWN {
+                info!("Received shutdown message");
                 let h = MOUSE_HOOK.swap(0, Ordering::SeqCst);
                 if h != 0 {
+                    info!("Unhooking mouse hook");
                     let _ = UnhookWindowsHookEx(HHOOK(h as *mut _));
                 }
+                info!("Unregistering hotkeys");
                 unregister_all_hotkeys();
+                info!("Restoring all windows");
                 restore_all_windows();
+                info!("Exiting process");
                 ExitProcess(0);
             }
             if msg.message == WM_HOTKEY {
@@ -1204,6 +1322,7 @@ fn main() -> Result<(), eframe::Error> {
         restore_all_windows();
     });
 
+    // 5. 最后启动 GUI，这样用户可以尽快看到界面
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([320.0, 450.0])
